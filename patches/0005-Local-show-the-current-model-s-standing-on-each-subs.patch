@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:11:58 +0200
-Subject: [PATCH 5/5] Local: show the current model's standing on each
+Subject: [PATCH 5/6] Local: show the current model's standing on each
  subscription in the limits popover
 
 ---

@@ -1,0 +1,501 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sun, 11 Oct 2026 02:16:17 +0200
+Subject: [PATCH 6/6] Local: order the model picker by subscription usage and
+ show 5h/weekly limits
+
+---
+ apps/web/src/components/chat/ModelListRow.tsx |  27 ++++
+ .../components/chat/ModelPickerContent.tsx    |  35 ++++-
+ .../components/chat/ModelPickerSidebar.tsx    |  32 ++++-
+ .../chat/ModelPickerUsage.logic.test.ts       | 101 ++++++++++++++
+ .../components/chat/ModelPickerUsage.logic.ts | 130 ++++++++++++++++++
+ .../chat/SubscriptionSwitch.logic.ts          |   6 +-
+ 6 files changed, 319 insertions(+), 12 deletions(-)
+ create mode 100644 apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
+ create mode 100644 apps/web/src/components/chat/ModelPickerUsage.logic.ts
+
+diff --git a/apps/web/src/components/chat/ModelListRow.tsx b/apps/web/src/components/chat/ModelListRow.tsx
+index 7a15f1736..f3689bb3f 100644
+--- a/apps/web/src/components/chat/ModelListRow.tsx
++++ b/apps/web/src/components/chat/ModelListRow.tsx
+@@ -15,6 +15,30 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { cn } from "~/lib/utils";
+ import { modelPickerModelKey } from "./modelPickerKeys";
+ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
++import type { PickerSubscriptionUsage } from "./ModelPickerUsage.logic";
++
++const USAGE_TIER_TAG = {
++  "use-now": { label: "Use now", className: "text-success" },
++  wait: { label: "Wait", className: "text-warning" },
++} as const;
++
++function ModelRowUsage({ usage }: { usage: PickerSubscriptionUsage }) {
++  const tag = usage.tier === "use-now" || usage.tier === "wait" ? USAGE_TIER_TAG[usage.tier] : null;
++  if (usage.windows.length === 0 && !tag) return null;
++  return (
++    <span className="flex shrink-0 items-center gap-1.5 text-xs font-normal leading-snug tabular-nums text-muted-foreground/70">
++      {usage.windows.map((window) => (
++        <span
++          key={window.shortLabel}
++          className={cn(window.runningOut && "text-warning", window.dimmed && "opacity-60")}
++        >
++          {window.shortLabel} {window.percentText}
++        </span>
++      ))}
++      {tag ? <span className={cn("font-medium", tag.className)}>{tag.label}</span> : null}
++    </span>
++  );
++}
+ 
+ export const ModelListRow = memo(function ModelListRow(props: {
+   index: number;
+@@ -30,6 +54,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
+    */
+   providerDisplayName: string;
+   providerAccentColor?: string | undefined;
++  /** The subscription's 5h and weekly limits, shown beside the provider. */
++  usage?: PickerSubscriptionUsage | undefined;
+   acpRegistryAgentId?: string | undefined;
+   acpRegistryIconUrl?: string | undefined;
+   isFavorite: boolean;
+@@ -95,6 +121,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
+             <span className="truncate text-xs font-normal leading-snug text-muted-foreground/70">
+               {providerLabel}
+             </span>
++            {props.usage ? <ModelRowUsage usage={props.usage} /> : null}
+           </div>
+         )}
+       </div>
+diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
+index fb6e79a88..9e54a2dd2 100644
+--- a/apps/web/src/components/chat/ModelPickerContent.tsx
++++ b/apps/web/src/components/chat/ModelPickerContent.tsx
+@@ -48,6 +48,7 @@ import {
+   type ProviderInstanceEntry,
+ } from "../../providerInstances";
+ import { providerModelKey, sortProviderModelItems } from "../../modelOrdering";
++import { pickerUsageByInstance, sortByPickerUsage } from "./ModelPickerUsage.logic";
+ 
+ type ModelPickerItem = {
+   slug: string;
+@@ -325,6 +326,20 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+     () => new Map(instanceEntries.map((entry) => [entry.instanceId, entry])),
+     [instanceEntries],
+   );
++  // Subscriptions are ordered from "use now" to "do not use yet" by their usage limits.
++  const [openedAtMs] = useState(() => Date.now());
++  const usageByInstance = useMemo(
++    () =>
++      pickerUsageByInstance(
++        instanceEntries.map((entry) => entry.snapshot),
++        openedAtMs,
++      ),
++    [instanceEntries, openedAtMs],
++  );
++  const usageOrderedEntries = useMemo(
++    () => sortByPickerUsage(instanceEntries, (entry) => entry.instanceId, usageByInstance),
++    [instanceEntries, usageByInstance],
++  );
+   const matchesLockedProvider = useCallback(
+     (entry: Pick<ProviderInstanceEntry, "driverKind" | "continuationGroupKey">): boolean => {
+       if (props.lockedProvider === null) return true;
+@@ -420,7 +435,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+     return disabled;
+   }, [instanceEntries, isLocked, matchesLockedProvider]);
+   const sidebarInstanceEntries = useMemo(() => {
+-    const enabledEntries = instanceEntries.filter(isProviderInstancePickerVisible);
++    const enabledEntries = usageOrderedEntries.filter(isProviderInstancePickerVisible);
+     if (!isLocked) {
+       return enabledEntries;
+     }
+@@ -434,11 +449,11 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+       }
+     }
+     return [...available, ...disabled];
+-  }, [instanceEntries, isLocked, matchesLockedProvider]);
++  }, [isLocked, matchesLockedProvider, usageOrderedEntries]);
+   const showSidebar = !isSearching && sidebarInstanceEntries.length > 0;
+   const instanceOrder = useMemo(
+-    () => instanceEntries.map((entry) => entry.instanceId),
+-    [instanceEntries],
++    () => usageOrderedEntries.map((entry) => entry.instanceId),
++    [usageOrderedEntries],
+   );
+ 
+   // Filter models based on search query and selected instance
+@@ -766,8 +781,14 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+     return mapping.size > 0 ? mapping : EMPTY_MODEL_JUMP_LABELS;
+   }, [keybindings, modelJumpCommandByKey, modelJumpShortcutContext]);
+   const modelListExtraData = useMemo(
+-    () => ({ favoritesSet, modelJumpLabelByKey, activeModelKey, selectedModelKeySet }),
+-    [favoritesSet, modelJumpLabelByKey, activeModelKey, selectedModelKeySet],
++    () => ({
++      favoritesSet,
++      modelJumpLabelByKey,
++      activeModelKey,
++      selectedModelKeySet,
++      usageByInstance,
++    }),
++    [favoritesSet, modelJumpLabelByKey, activeModelKey, selectedModelKeySet, usageByInstance],
+   );
+ 
+   useEffect(() => {
+@@ -859,6 +880,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+             onSelectInstance={handleSelectInstance}
+             onFocusSearch={focusSearchInput}
+             instanceEntries={sidebarInstanceEntries}
++            usageByInstance={usageByInstance}
+             showFavorites
+             {...(selectableUnavailableInstanceIds ? { selectableUnavailableInstanceIds } : {})}
+             {...(lockedDisabledInstanceIds
+@@ -1031,6 +1053,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+                         driverKind={model.driverKind}
+                         providerDisplayName={model.instanceDisplayName}
+                         providerAccentColor={model.instanceAccentColor}
++                        usage={usageByInstance.get(model.instanceId)}
+                         acpRegistryAgentId={model.acpRegistryAgentId}
+                         acpRegistryIconUrl={model.acpRegistryIconUrl}
+                         isFavorite={favoritesSet.has(
+diff --git a/apps/web/src/components/chat/ModelPickerSidebar.tsx b/apps/web/src/components/chat/ModelPickerSidebar.tsx
+index 6d4710205..fdaf78396 100644
+--- a/apps/web/src/components/chat/ModelPickerSidebar.tsx
++++ b/apps/web/src/components/chat/ModelPickerSidebar.tsx
+@@ -3,6 +3,7 @@ import { type ProviderInstanceId } from "@t3tools/contracts";
+ import { memo, useLayoutEffect, useRef, useState } from "react";
+ import { SparklesIcon, StarIcon } from "lucide-react";
+ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
++import { formatPickerUsageWindows, type PickerSubscriptionUsage } from "./ModelPickerUsage.logic";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { cn } from "~/lib/utils";
+ import {
+@@ -51,6 +52,8 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
+    * their own model list.
+    */
+   instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
++  /** 5h and weekly limits per instance, for the tooltip and the use-now/wait dot. */
++  usageByInstance?: ReadonlyMap<ProviderInstanceId, PickerSubscriptionUsage>;
+   /** Render the favorites rail entry. Hidden for locked-provider instance switching. */
+   showFavorites?: boolean;
+   /** Instance ids shown in the rail but unavailable for the current picker context. */
+@@ -160,13 +163,27 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
+             const showNewBadge = props.newBadgeInstanceIds?.has(entry.instanceId) ?? false;
+             const showInstanceBadge = shouldShowInstanceBadge(entry, props.instanceEntries);
+ 
++            const usage = props.usageByInstance?.get(entry.instanceId);
++            const usageText = usage ? formatPickerUsageWindows(usage) : "";
+             const tooltip = isUnavailable
+               ? describeUnavailableInstance(entry)
+               : isContextDisabled
+                 ? (props.getDisabledInstanceTooltip?.(entry) ?? entry.displayName)
+-                : showNewBadge
+-                  ? `${entry.displayName} — New`
+-                  : entry.displayName;
++                : [
++                    showNewBadge ? `${entry.displayName} — New` : entry.displayName,
++                    usageText,
++                    usage?.tier === "use-now"
++                      ? `Use now: ${usage.reason}`
++                      : usage?.tier === "wait"
++                        ? `Wait: ${usage.reason}`
++                        : "",
++                  ]
++                    .filter(Boolean)
++                    .join(" · ");
++            const usageDot =
++              !isDisabled && (usage?.tier === "use-now" || usage?.tier === "wait")
++                ? usage.tier
++                : null;
+ 
+             const button = (
+               <Toolbar.Button
+@@ -214,6 +231,15 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
+                   }
+                   {...(entry.accentColor ? { badgeClassName: "h-3 min-w-3 px-0.5 text-5xs" } : {})}
+                 />
++                {usageDot ? (
++                  <span
++                    className={cn(
++                      "pointer-events-none absolute left-0.5 top-0.5 z-40 size-1.5 rounded-full",
++                      usageDot === "use-now" ? "bg-success" : "bg-warning",
++                    )}
++                    aria-hidden
++                  />
++                ) : null}
+                 {showNewBadge ? (
+                   <span className={NEW_BADGE_CLASS} aria-hidden>
+                     <SparklesIcon className="size-2" />
+diff --git a/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts b/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
+new file mode 100644
+index 000000000..3bf776026
+--- /dev/null
++++ b/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
+@@ -0,0 +1,101 @@
++import {
++  ProviderInstanceId,
++  type ServerProvider,
++  type ServerProviderUsageWindow,
++} from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  formatPickerUsageWindows,
++  pickerSubscriptionUsage,
++  pickerUsageByInstance,
++  sortByPickerUsage,
++} from "./ModelPickerUsage.logic";
++
++const nowMs = Date.parse("2026-10-11T12:00:00Z");
++const iso = (offsetMs: number) => new Date(nowMs + offsetMs).toISOString();
++const HOUR = 60 * 60_000;
++
++const window = (
++  kind: "session" | "weekly",
++  usedPercent: number,
++  resetInHours: number,
++): ServerProviderUsageWindow => ({
++  id: kind === "session" ? "five_hour" : "seven_day",
++  kind,
++  label: kind === "session" ? "Session" : "Weekly",
++  usedPercent,
++  resetsAt: iso(resetInHours * HOUR),
++  windowDurationMins: kind === "session" ? 300 : 7 * 24 * 60,
++  checkedAt: iso(-60_000),
++});
++
++function provider(
++  instanceId: string,
++  windows: ReadonlyArray<ServerProviderUsageWindow>,
++  overrides: Partial<ServerProvider> = {},
++): ServerProvider {
++  return {
++    instanceId: ProviderInstanceId.make(instanceId),
++    driver: "claudeAgent",
++    displayName: instanceId,
++    enabled: true,
++    installed: true,
++    version: "1.0.0",
++    status: "ready",
++    auth: { status: "authenticated" },
++    checkedAt: iso(0),
++    models: [],
++    slashCommands: [],
++    skills: [],
++    usageLimits: { checkedAt: iso(-60_000), windows: [...windows] },
++    ...overrides,
++  } as ServerProvider;
++}
++
++describe("pickerSubscriptionUsage", () => {
++  it("shows the 5h and weekly windows like the stats line", () => {
++    const usage = pickerSubscriptionUsage(
++      provider("a", [window("session", 33, 2), window("weekly", 4, 100)]),
++      nowMs,
++    );
++    expect(usage.tier).toBe("ok");
++    expect(formatPickerUsageWindows(usage)).toBe("5h 33% · Week 4%");
++  });
++
++  it("marks a weekly allowance about to reset largely unused as use now", () => {
++    const usage = pickerSubscriptionUsage(
++      provider("a", [window("session", 0, 4), window("weekly", 20, 10)]),
++      nowMs,
++    );
++    expect(usage.tier).toBe("use-now");
++    expect(usage.reason).toContain("80% of the weekly allowance is unused");
++  });
++
++  it("says wait when a window is on pace to run out", () => {
++    // 80% used with 1 of 5 hours left: on pace for 100%.
++    const usage = pickerSubscriptionUsage(
++      provider("a", [window("session", 80, 1), window("weekly", 10, 100)]),
++      nowMs,
++    );
++    expect(usage.tier).toBe("wait");
++    expect(usage.windows[0]?.runningOut).toBe(true);
++  });
++});
++
++describe("sortByPickerUsage", () => {
++  it("orders from use now to do not use yet, then by weekly room per hour", () => {
++    const providers = [
++      provider("off", [window("weekly", 0, 10)], { enabled: false }),
++      provider("wait", [window("session", 95, 1), window("weekly", 10, 100)]),
++      provider("unknown", [], { usageLimits: undefined }),
++      provider("ok-slow", [window("weekly", 10, 150)]),
++      provider("ok-fast", [window("weekly", 50, 30)]),
++      provider("use-now", [window("weekly", 30, 12)]),
++    ];
++    const usage = pickerUsageByInstance(providers, nowMs);
++    expect(
++      sortByPickerUsage(providers, (p) => p.instanceId, usage).map((p) => p.instanceId),
++    ).toEqual(["use-now", "ok-fast", "ok-slow", "unknown", "wait", "off"]);
++  });
++});
+diff --git a/apps/web/src/components/chat/ModelPickerUsage.logic.ts b/apps/web/src/components/chat/ModelPickerUsage.logic.ts
+new file mode 100644
+index 000000000..3422ddaf5
+--- /dev/null
++++ b/apps/web/src/components/chat/ModelPickerUsage.logic.ts
+@@ -0,0 +1,130 @@
++import type { ProviderInstanceId, ServerProvider } from "@t3tools/contracts";
++import { formatResetsIn } from "@t3tools/shared/usageLimits";
++
++import {
++  composerLimitDisplay,
++  composerLimitsFreshness,
++  selectComposerLimitWindows,
++} from "./ComposerStats.logic";
++import {
++  EXPIRING_MAX_USED_PERCENT,
++  EXPIRING_WITHIN_MS,
++  canRun,
++  describePace,
++  isRunningOut,
++  windowPace,
++} from "./SubscriptionSwitch.logic";
++
++/**
++ * Where a subscription belongs in the model picker, best to use first:
++ * `use-now` has a weekly allowance about to reset largely unused, `wait` is on
++ * pace to run out of a window, `unknown` has no recent reading and `off`
++ * cannot run at all.
++ */
++export type PickerUsageTier = "use-now" | "ok" | "unknown" | "wait" | "off";
++
++const TIER_ORDER: ReadonlyArray<PickerUsageTier> = ["use-now", "ok", "unknown", "wait", "off"];
++
++export interface PickerUsageWindow {
++  readonly shortLabel: string;
++  readonly percentText: string;
++  readonly runningOut: boolean;
++  readonly dimmed: boolean;
++}
++
++export interface PickerSubscriptionUsage {
++  readonly tier: PickerUsageTier;
++  /** Percent of the weekly allowance left per hour until it resets: how hard it needs using. */
++  readonly urgency: number;
++  /** The account-wide 5h and weekly windows, as the composer stats line shows them. */
++  readonly windows: ReadonlyArray<PickerUsageWindow>;
++  readonly reason: string | null;
++}
++
++const WEEK_HOURS = 7 * 24;
++
++export function pickerSubscriptionUsage(
++  provider: ServerProvider,
++  nowMs: number,
++): PickerSubscriptionUsage {
++  const limits = provider.usageLimits;
++  const selected = selectComposerLimitWindows(limits);
++  const paces = selected.map(({ window }) => windowPace(window, nowMs));
++  const windows = selected.map(({ window, shortLabel }, index) => {
++    const display = composerLimitDisplay(window, limits?.checkedAt, nowMs);
++    return {
++      shortLabel,
++      percentText: display.percentText,
++      runningOut: display.displayPercent !== null && isRunningOut(paces[index]!),
++      dimmed: display.dimmed,
++    };
++  });
++  const base = { urgency: 0, windows, reason: null };
++  if (!canRun(provider)) return { ...base, tier: "off" };
++  const fresh =
++    limits !== undefined &&
++    limits.unavailable === undefined &&
++    selected.length > 0 &&
++    composerLimitsFreshness(
++      selected.map(({ window }) => window.checkedAt ?? limits.checkedAt),
++      nowMs,
++    ).status !== "expired";
++  if (!fresh) return { ...base, tier: "unknown" };
++
++  const runningOut = paces.find(isRunningOut);
++  if (runningOut) return { ...base, tier: "wait", reason: describePace(runningOut, nowMs) };
++
++  const weekly = paces.find((pace) => pace.window.kind === "weekly");
++  const urgency = weekly
++    ? (100 - weekly.usedPercent) /
++      Math.max(1, weekly.resetInMs === null ? WEEK_HOURS : weekly.resetInMs / 3_600_000)
++    : 0;
++  if (
++    weekly &&
++    weekly.resetInMs !== null &&
++    weekly.resetInMs <= EXPIRING_WITHIN_MS &&
++    weekly.usedPercent <= EXPIRING_MAX_USED_PERCENT
++  ) {
++    const resets = formatResetsIn(weekly.window, nowMs) ?? "resets soon";
++    return {
++      ...base,
++      tier: "use-now",
++      urgency,
++      reason: `${Math.round(100 - weekly.usedPercent)}% of the ${weekly.window.label.toLowerCase()} allowance is unused and ${resets}`,
++    };
++  }
++  return { ...base, tier: "ok", urgency };
++}
++
++/** Usage per subscription, keyed by instance. */
++export function pickerUsageByInstance(
++  providers: ReadonlyArray<ServerProvider>,
++  nowMs: number,
++): ReadonlyMap<ProviderInstanceId, PickerSubscriptionUsage> {
++  return new Map(
++    providers.map((provider) => [provider.instanceId, pickerSubscriptionUsage(provider, nowMs)]),
++  );
++}
++
++/**
++ * Orders subscriptions from "use now" to "do not use yet": by tier, then by
++ * how much weekly allowance is left per hour until it resets. Ties keep their
++ * configured order.
++ */
++export function sortByPickerUsage<T>(
++  items: ReadonlyArray<T>,
++  instanceIdOf: (item: T) => ProviderInstanceId,
++  usageByInstance: ReadonlyMap<ProviderInstanceId, PickerSubscriptionUsage>,
++): T[] {
++  const tierRank = (usage: PickerSubscriptionUsage | undefined) =>
++    TIER_ORDER.indexOf(usage?.tier ?? "unknown");
++  return items.toSorted((a, b) => {
++    const usageA = usageByInstance.get(instanceIdOf(a));
++    const usageB = usageByInstance.get(instanceIdOf(b));
++    return tierRank(usageA) - tierRank(usageB) || (usageB?.urgency ?? 0) - (usageA?.urgency ?? 0);
++  });
++}
++
++export function formatPickerUsageWindows(usage: PickerSubscriptionUsage): string {
++  return usage.windows.map((window) => `${window.shortLabel} ${window.percentText}`).join(" · ");
++}
+diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
+index 6557fdbc0..ca93fe8bc 100644
+--- a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
++++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
+@@ -117,7 +117,7 @@ export function assessSubscription(
+   return { paces, runningOut, worstPercent };
+ }
+ 
+-function canRun(provider: ServerProvider): boolean {
++export function canRun(provider: ServerProvider): boolean {
+   return (
+     provider.enabled &&
+     provider.availability !== "unavailable" &&
+@@ -135,7 +135,7 @@ function modelOn(provider: ServerProvider, model: string) {
+ const providerName = (provider: ServerProvider) =>
+   provider.displayName?.trim() || provider.instanceId;
+ 
+-function describe(pace: WindowPace, nowMs: number): string {
++export function describePace(pace: WindowPace, nowMs: number): string {
+   const resets = formatResetsIn(pace.window, nowMs);
+   const when = resets ? ` before it ${resets}` : "";
+   return pace.usedPercent >= SWITCH_USED_PERCENT ||
+@@ -187,7 +187,7 @@ export function recommendSubscriptionSwitch(input: {
+     return suggest(
+       "pressure",
+       best,
+-      `${describe(currentAssessment.runningOut, nowMs)} on ${providerName(current)}. ` +
++      `${describePace(currentAssessment.runningOut, nowMs)} on ${providerName(current)}. ` +
+         `${providerName(best.provider)} is at most ${Math.round(best.assessment.worstPercent)}% on pace.`,
+     );
+   }
