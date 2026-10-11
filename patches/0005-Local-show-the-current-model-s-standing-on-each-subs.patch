@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sun, 11 Oct 2026 02:11:58 +0200
+Subject: [PATCH 5/5] Local: show the current model's standing on each
+ subscription in the limits popover
+
+---
+ .../web/src/components/chat/ComposerStats.tsx | 54 ++++++++++++++++++-
+ .../chat/SubscriptionSwitch.logic.test.ts     | 24 +++++++++
+ .../chat/SubscriptionSwitch.logic.ts          | 45 ++++++++++++++++
+ 3 files changed, 121 insertions(+), 2 deletions(-)
+
+diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
+index 4a4b72fcd..3959ec97e 100644
+--- a/apps/web/src/components/chat/ComposerStats.tsx
++++ b/apps/web/src/components/chat/ComposerStats.tsx
+@@ -28,7 +28,7 @@ import {
+   deriveTurnElapsedMs,
+   selectComposerLimitWindows,
+ } from "./ComposerStats.logic";
+-import { recommendSubscriptionSwitch } from "./SubscriptionSwitch.logic";
++import { recommendSubscriptionSwitch, subscriptionStandings } from "./SubscriptionSwitch.logic";
+ 
+ function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
+   const textRef = useRef<HTMLSpanElement>(null);
+@@ -211,12 +211,55 @@ function UsageLimitRows({
+   );
+ }
+ 
++const STANDING_TEXT = {
++  ok: (percent: number | null) => `${Math.round(percent ?? 0)}% on pace`,
++  "running-out": (percent: number | null) => `running out (${Math.round(percent ?? 0)}% on pace)`,
++  unknown: () => "no recent reading",
++  unavailable: () => "signed out or off",
++} as const;
++
++/** How the current model stands on each subscription that offers it. */
++function SubscriptionStandings({
++  subscriptionSwitch,
++  now,
++}: {
++  subscriptionSwitch: SubscriptionSwitchInput;
++  now: number;
++}) {
++  const standings = subscriptionStandings({ ...subscriptionSwitch, nowMs: now });
++  if (standings.length < 2) return null;
++  return (
++    <div className="flex flex-col gap-1">
++      <h4 className="text-muted-foreground">This model on your subscriptions</h4>
++      <dl className="flex flex-col gap-0.5">
++        {standings.map((standing) => (
++          <div key={standing.instanceId} className="flex items-baseline justify-between gap-4">
++            <dt className={standing.current ? "font-medium" : "text-muted-foreground"}>
++              {standing.providerName}
++              {standing.current ? " (current)" : ""}
++            </dt>
++            <dd
++              className={`text-right tabular-nums ${
++                standing.state === "running-out" ? "text-warning" : ""
++              }`}
++            >
++              {STANDING_TEXT[standing.state](standing.worstPercent)}
++            </dd>
++          </div>
++        ))}
++      </dl>
++    </div>
++  );
++}
++
+ function UsageLimitsSummary({
+   limits,
+   providerName,
++  subscriptionSwitch,
+ }: {
+   limits: ServerProviderUsageLimits;
+   providerName: string;
++  subscriptionSwitch: SubscriptionSwitchInput | null;
+ }) {
+   const [now, setNow] = useState(Date.now);
+   useEffect(() => {
+@@ -264,6 +307,9 @@ function UsageLimitsSummary({
+             <span className="truncate text-muted-foreground">{providerName}</span>
+           </div>
+           <UsageLimitRows windows={limits.windows} checkedAt={limits.checkedAt} now={now} />
++          {subscriptionSwitch && (
++            <SubscriptionStandings subscriptionSwitch={subscriptionSwitch} now={now} />
++          )}
+           <p className="text-muted-foreground">
+             Usage comes from account and turn readings, with CLI estimates filling gaps. Stale
+             values show their age; readings older than 15 minutes are hidden.
+@@ -643,7 +689,11 @@ export function ComposerStats({
+       className="flex flex-wrap items-center gap-x-4 gap-y-1 px-5 pt-1.5 text-2xs leading-4 text-muted-foreground tabular-nums"
+     >
+       {usageLimits && (
+-        <UsageLimitsSummary limits={usageLimits.limits} providerName={usageLimits.providerName} />
++        <UsageLimitsSummary
++          limits={usageLimits.limits}
++          providerName={usageLimits.providerName}
++          subscriptionSwitch={subscriptionSwitch}
++        />
+       )}
+       {subscriptionSwitch && <SubscriptionSwitchChip {...subscriptionSwitch} />}
+       {stats.length > 0 && (
+diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
+index da5f1aa6e..be9c04001 100644
+--- a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
++++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
+@@ -7,6 +7,7 @@ import { describe, expect, it } from "vite-plus/test";
+ 
+ import {
+   recommendSubscriptionSwitch,
++  subscriptionStandings,
+   windowPace,
+   windowsForModel,
+ } from "./SubscriptionSwitch.logic";
+@@ -224,3 +225,26 @@ describe("recommendSubscriptionSwitch", () => {
+     ).toBeNull();
+   });
+ });
++
++describe("subscriptionStandings", () => {
++  it("lists every subscription offering the model, current first, with its state", () => {
++    const standings = subscriptionStandings({
++      instanceId: ProviderInstanceId.make("b"),
++      model: "claude-opus-5-5",
++      providers: [
++        provider("a", [session(10, 2)]),
++        provider("b", [session(95, 1)]),
++        provider("no-model", [session(5, 1)], { models: [] }),
++        provider("signed-out", [session(5, 1)], { auth: { status: "unauthenticated" } }),
++        provider("unknown", [], { usageLimits: undefined }),
++      ],
++      nowMs,
++    });
++    expect(standings.map((s) => [s.instanceId, s.state])).toEqual([
++      ["b", "running-out"],
++      ["a", "ok"],
++      ["signed-out", "unavailable"],
++      ["unknown", "unknown"],
++    ]);
++  });
++});
+diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
+index af475f0b2..6557fdbc0 100644
+--- a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
++++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
+@@ -223,3 +223,48 @@ export function recommendSubscriptionSwitch(input: {
+       `${soonest.weekly.window.label.toLowerCase()} allowance is unused and ${resets}. Use it first.`,
+   );
+ }
++
++export interface SubscriptionStanding {
++  readonly instanceId: ProviderInstanceId;
++  readonly providerName: string;
++  readonly current: boolean;
++  readonly state: "ok" | "running-out" | "unknown" | "unavailable";
++  /** Highest used or projected percent among the model's windows; null when unknown. */
++  readonly worstPercent: number | null;
++}
++
++/** Every subscription that offers this model, current first, for the limits popover. */
++export function subscriptionStandings(input: {
++  readonly instanceId: ProviderInstanceId | null;
++  readonly model: string | null;
++  readonly providers: ReadonlyArray<ServerProvider>;
++  readonly nowMs: number;
++}): ReadonlyArray<SubscriptionStanding> {
++  const { instanceId, model, providers, nowMs } = input;
++  if (instanceId === null || model === null) return [];
++  return providers
++    .flatMap((provider) => {
++      const current = provider.instanceId === instanceId;
++      const target = current ? { slug: model } : modelOn(provider, model);
++      if (!target) return [];
++      const assessment = assessSubscription(provider, target.slug, nowMs);
++      const state: SubscriptionStanding["state"] =
++        !current && !canRun(provider)
++          ? "unavailable"
++          : assessment === null
++            ? "unknown"
++            : assessment.runningOut
++              ? "running-out"
++              : "ok";
++      return [
++        {
++          instanceId: provider.instanceId,
++          providerName: providerName(provider),
++          current,
++          state,
++          worstPercent: assessment?.worstPercent ?? null,
++        },
++      ];
++    })
++    .toSorted((a, b) => Number(b.current) - Number(a.current));
++}
