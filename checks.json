@@ -15,7 +15,8 @@
     "packages/provider-core/src/server/managedProvider.test.ts",
     "apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts",
     "apps/web/src/lib/contextWindow.test.ts",
-    "apps/server/src/provider/codexUsageLimits.test.ts"
+    "apps/server/src/provider/codexUsageLimits.test.ts",
+    "apps/server/src/usage/usageLimitsHttp.test.ts"
   ],
   "typecheck": [
     "apps/server",

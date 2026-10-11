@@ -1,0 +1,350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sun, 11 Oct 2026 09:21:12 +0200
+Subject: [PATCH 7/7] Local: serve usage limits as a JSON feed for desktop
+ widgets
+
+GET /api/usage-limits returns every enabled subscription's session and
+weekly windows from the provider snapshots the server already holds, so a
+widget such as Dockset can poll it. Requests need the bearer token kept in
+<stateDir>/usage-limits-api-token, created on first start.
+---
+ apps/server/src/server.ts                     |   2 +
+ apps/server/src/usage/usageLimitsHttp.test.ts | 147 +++++++++++++++++
+ apps/server/src/usage/usageLimitsHttp.ts      | 153 ++++++++++++++++++
+ 3 files changed, 302 insertions(+)
+ create mode 100644 apps/server/src/usage/usageLimitsHttp.test.ts
+ create mode 100644 apps/server/src/usage/usageLimitsHttp.ts
+
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index f1daa7200..adfa9d9bc 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -85,6 +85,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
+ import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
+ import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
+ import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
++import * as UsageLimitsHttp from "./usage/usageLimitsHttp.ts";
+ import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
+ import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
+ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
+@@ -702,6 +703,7 @@ const layerMakeRoutes = Layer.mergeAll(
+     ServerHttp.layerOtlpTracesProxyRoute,
+     ServerHttp.layerAssetRoute,
+     ServerHttp.layerAttachmentUploadRoute,
++    UsageLimitsHttp.layerUsageLimitsRoute,
+     DeviceHubProxy.layer,
+     ServerBrowserStream.routeLayer,
+     ServerHttp.layerStaticAndDevRoute,
+diff --git a/apps/server/src/usage/usageLimitsHttp.test.ts b/apps/server/src/usage/usageLimitsHttp.test.ts
+new file mode 100644
+index 000000000..2678e5cd6
+--- /dev/null
++++ b/apps/server/src/usage/usageLimitsHttp.test.ts
+@@ -0,0 +1,147 @@
++import type { ServerProvider, ServerProviderUsageLimits } from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import { bearerTokenMatches, buildUsageLimitsFeed } from "./usageLimitsHttp.ts";
++
++const generatedAt = "2026-10-11T08:00:00.000Z";
++const checkedAt = "2026-10-11T07:58:00.000Z";
++
++function provider(
++  overrides: Partial<Omit<ServerProvider, "usageLimits">> & {
++    readonly usageLimits?: ServerProviderUsageLimits;
++  },
++): ServerProvider {
++  return {
++    instanceId: "claudeAgent",
++    driver: "claudeAgent",
++    enabled: true,
++    auth: { status: "authenticated" },
++    ...overrides,
++  } as unknown as ServerProvider;
++}
++
++const claudeLimits: ServerProviderUsageLimits = {
++  checkedAt,
++  windows: [
++    {
++      id: "five_hour",
++      kind: "session",
++      label: "5 hour",
++      usedPercent: 42,
++      resetsAt: "2026-10-11T10:00:00.000Z",
++    },
++    {
++      id: "seven_day",
++      kind: "weekly",
++      label: "Weekly",
++      usedPercent: 18,
++      resetsAt: "2026-10-15T09:00:00.000Z",
++    },
++    { id: "seven_day_opus", kind: "weekly", label: "Weekly · Opus", usedPercent: 64 },
++  ],
++};
++
++describe("buildUsageLimitsFeed", () => {
++  it("lists each subscription with its session and account-wide weekly window", () => {
++    const feed = buildUsageLimitsFeed(
++      [
++        provider({
++          displayName: "DEV",
++          accentColor: "#0891b2",
++          auth: { status: "authenticated", label: "Claude Max" },
++          usageLimits: claudeLimits,
++        }),
++      ],
++      { generatedAt },
++    );
++
++    expect(feed.generatedAt).toBe(generatedAt);
++    expect(feed.subscriptions).toHaveLength(1);
++    const [subscription] = feed.subscriptions;
++    expect(subscription).toMatchObject({
++      id: "claudeAgent",
++      name: "DEV",
++      driver: "claudeAgent",
++      plan: "Claude Max",
++      color: "#0891b2",
++      checkedAt,
++      available: true,
++      message: null,
++      session: { id: "five_hour", usedPercent: 42, remainingPercent: 58 },
++      weekly: { id: "seven_day", usedPercent: 18, remainingPercent: 82 },
++    });
++    expect(subscription!.windows.map((window) => window.id)).toEqual([
++      "five_hour",
++      "seven_day",
++      "seven_day_opus",
++    ]);
++    expect(subscription!.windows[2]).toMatchObject({ resetsAt: null, resetPending: false });
++  });
++
++  it("skips disabled instances and those without usage, and filters by driver", () => {
++    const providers = [
++      provider({ instanceId: "claudeAgent" as never, usageLimits: claudeLimits }),
++      provider({
++        instanceId: "claudeAgent-team" as never,
++        enabled: false,
++        usageLimits: claudeLimits,
++      }),
++      provider({ instanceId: "cursor" as never, driver: "cursor" as never }),
++      provider({
++        instanceId: "codex" as never,
++        driver: "codex" as never,
++        usageLimits: { checkedAt, windows: [] },
++      }),
++    ];
++
++    expect(
++      buildUsageLimitsFeed(providers, { generatedAt }).subscriptions.map((entry) => entry.id),
++    ).toEqual(["claudeAgent", "codex"]);
++    expect(
++      buildUsageLimitsFeed(providers, { generatedAt, driver: "codex" }).subscriptions.map(
++        (entry) => entry.id,
++      ),
++    ).toEqual(["codex"]);
++  });
++
++  it("falls back to the instance id and reports why limits are unavailable", () => {
++    const [subscription] = buildUsageLimitsFeed(
++      [
++        provider({
++          instanceId: "claude-claude" as never,
++          usageLimits: {
++            checkedAt,
++            windows: [],
++            unavailable: { reason: "unsupported", message: "API key login" },
++          },
++        }),
++      ],
++      { generatedAt },
++    ).subscriptions;
++
++    expect(subscription).toMatchObject({
++      name: "claude-claude",
++      plan: null,
++      color: null,
++      available: false,
++      message: "API key login",
++      session: null,
++      weekly: null,
++    });
++  });
++});
++
++describe("bearerTokenMatches", () => {
++  it("accepts only the exact bearer token", () => {
++    expect(bearerTokenMatches("Bearer secret-token", "secret-token")).toBe(true);
++    expect(bearerTokenMatches("bearer secret-token", "secret-token")).toBe(true);
++    expect(bearerTokenMatches("Bearer wrong", "secret-token")).toBe(false);
++    expect(bearerTokenMatches("secret-token", "secret-token")).toBe(false);
++    expect(bearerTokenMatches(undefined, "secret-token")).toBe(false);
++  });
++
++  it("refuses every request when no token could be prepared", () => {
++    expect(bearerTokenMatches("Bearer ", "")).toBe(false);
++    expect(bearerTokenMatches("Bearer anything", "")).toBe(false);
++  });
++});
+diff --git a/apps/server/src/usage/usageLimitsHttp.ts b/apps/server/src/usage/usageLimitsHttp.ts
+new file mode 100644
+index 000000000..b29bdb2d5
+--- /dev/null
++++ b/apps/server/src/usage/usageLimitsHttp.ts
+@@ -0,0 +1,153 @@
++// @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto has no timingSafeEqual.
++import * as NodeCrypto from "node:crypto";
++import type { ServerProvider, ServerProviderUsageWindow } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as Path from "effect/Path";
++import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
++
++import * as ServerConfig from "../config.ts";
++import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
++
++/**
++ * A read-only JSON feed of every subscription's usage windows, for desktop
++ * widgets such as Dockset that poll a local URL. It reads the snapshots the
++ * registry already holds and never triggers a probe of its own.
++ */
++export const USAGE_LIMITS_ROUTE_PATH = "/api/usage-limits";
++export const USAGE_LIMITS_TOKEN_FILE = "usage-limits-api-token";
++
++export interface UsageLimitsFeedWindow {
++  readonly id: string;
++  readonly kind: ServerProviderUsageWindow["kind"];
++  readonly label: string;
++  readonly usedPercent: number;
++  readonly remainingPercent: number;
++  readonly resetsAt: string | null;
++  readonly resetPending: boolean;
++}
++
++export interface UsageLimitsFeedSubscription {
++  readonly id: string;
++  readonly name: string;
++  readonly driver: string;
++  readonly plan: string | null;
++  readonly color: string | null;
++  readonly checkedAt: string | null;
++  readonly available: boolean;
++  readonly message: string | null;
++  readonly session: UsageLimitsFeedWindow | null;
++  readonly weekly: UsageLimitsFeedWindow | null;
++  readonly windows: readonly UsageLimitsFeedWindow[];
++}
++
++export interface UsageLimitsFeed {
++  readonly generatedAt: string;
++  readonly subscriptions: readonly UsageLimitsFeedSubscription[];
++}
++
++function feedWindow(window: ServerProviderUsageWindow): UsageLimitsFeedWindow {
++  const usedPercent = Math.min(Math.max(window.usedPercent, 0), 100);
++  return {
++    id: window.id,
++    kind: window.kind,
++    label: window.label,
++    usedPercent,
++    remainingPercent: 100 - usedPercent,
++    resetsAt: window.resetsAt ?? null,
++    resetPending: window.resetPending === true,
++  };
++}
++
++/** Enabled instances that report usage, optionally limited to one driver. */
++export function buildUsageLimitsFeed(
++  providers: readonly ServerProvider[],
++  options: { readonly generatedAt: string; readonly driver?: string | undefined },
++): UsageLimitsFeed {
++  const subscriptions = providers
++    .filter((provider) => provider.enabled && provider.usageLimits !== undefined)
++    .filter((provider) => !options.driver || String(provider.driver) === options.driver)
++    .map((provider): UsageLimitsFeedSubscription => {
++      const limits = provider.usageLimits!;
++      const windows = limits.windows.map(feedWindow);
++      // Model-scoped weekly rows follow the account-wide one, so the first weekly is the account's.
++      return {
++        id: String(provider.instanceId),
++        name: provider.displayName?.trim() || String(provider.instanceId),
++        driver: String(provider.driver),
++        plan: provider.auth.label ?? null,
++        color: provider.accentColor ?? null,
++        checkedAt: limits.checkedAt,
++        available: limits.unavailable === undefined,
++        message: limits.unavailable?.message ?? null,
++        session: windows.find((window) => window.kind === "session") ?? null,
++        weekly: windows.find((window) => window.kind === "weekly") ?? null,
++        windows,
++      };
++    });
++  return { generatedAt: options.generatedAt, subscriptions };
++}
++
++export function bearerTokenMatches(header: string | undefined, token: string): boolean {
++  const match = /^Bearer\s+(\S+)\s*$/i.exec(header ?? "");
++  if (!match || token.length === 0) return false;
++  const digest = (value: string) => NodeCrypto.createHash("sha256").update(value).digest();
++  return NodeCrypto.timingSafeEqual(digest(match[1]!), digest(token));
++}
++
++/** Reads the token file, creating it with a random token on first start. */
++const ensureToken = Effect.gen(function* () {
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const { stateDir } = yield* ServerConfig.ServerConfig;
++  const tokenPath = path.join(stateDir, USAGE_LIMITS_TOKEN_FILE);
++  const existing = yield* fs.readFileString(tokenPath).pipe(Effect.option);
++  if (Option.isSome(existing) && existing.value.trim().length > 0) {
++    return existing.value.trim();
++  }
++  const token = NodeCrypto.randomBytes(32).toString("hex");
++  yield* fs.writeFileString(tokenPath, `${token}\n`, { mode: 0o600 });
++  return token;
++});
++
++const noStore = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
++
++export const layerUsageLimitsRoute = Layer.unwrap(
++  Effect.gen(function* () {
++    const token = yield* ensureToken.pipe(
++      Effect.tapError((cause) =>
++        Effect.logWarning("Usage limits feed disabled: could not prepare its token.", { cause }),
++      ),
++      Effect.orElseSucceed(() => ""),
++    );
++    return HttpRouter.add(
++      "GET",
++      USAGE_LIMITS_ROUTE_PATH,
++      Effect.gen(function* () {
++        const request = yield* HttpServerRequest.HttpServerRequest;
++        if (!bearerTokenMatches(request.headers.authorization, token)) {
++          return HttpServerResponse.text("Unauthorized", {
++            status: 401,
++            headers: { ...noStore, "www-authenticate": "Bearer" },
++          });
++        }
++        const url = HttpServerRequest.toURL(request);
++        const driver = Option.isSome(url)
++          ? (url.value.searchParams.get("driver") ?? undefined)
++          : undefined;
++        const registry = yield* ProviderRegistry.ProviderRegistry;
++        const providers = yield* registry.getProviders;
++        const generatedAt = DateTime.formatIso(yield* DateTime.now);
++        return HttpServerResponse.jsonUnsafe(
++          buildUsageLimitsFeed(providers, { generatedAt, driver }),
++          {
++            headers: noStore,
++          },
++        );
++      }),
++    );
++  }),
++);

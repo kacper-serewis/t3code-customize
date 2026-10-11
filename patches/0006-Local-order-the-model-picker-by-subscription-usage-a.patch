@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:16:17 +0200
-Subject: [PATCH 6/6] Local: order the model picker by subscription usage and
+Subject: [PATCH 6/7] Local: order the model picker by subscription usage and
  show 5h/weekly limits
 
 ---
