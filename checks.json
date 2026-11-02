@@ -17,7 +17,8 @@
     "apps/web/src/lib/contextWindow.test.ts",
     "apps/server/src/provider/codexUsageLimits.test.ts",
     "apps/web/src/components/chat/ModelPickerUsage.logic.test.ts",
-    "apps/server/src/usage/usageLimitsHttp.test.ts"
+    "apps/server/src/usage/usageLimitsHttp.test.ts",
+    "apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts"
   ],
   "typecheck": [
     "apps/server",

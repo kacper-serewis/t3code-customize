@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Mon, 2 Nov 2026 23:22:06 +0100
+Subject: [PATCH 8/9] Local: show a proxy's pooled limits in the thread details
+ card
+
+A Claude instance that talks to a custom endpoint (a CLI proxy) cannot read
+subscription limits itself, so the thread details card only said
+"Limits: Unavailable" while the Usage page showed the proxy's accounts. The
+card now falls back to those accounts for the same driver, pooled the way the
+Usage page summarises them, with a tooltip naming the source and account
+count. Instances on their own subscription keep showing their own limits or
+their own failure.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../chat/ThreadDetailsUsage.logic.test.ts     | 164 ++++++++++++++++++
+ .../chat/ThreadDetailsUsage.logic.ts          |  83 +++++++++
+ .../components/chat/ThreadDetailsUsage.tsx    |  79 +++++++--
+ 3 files changed, 311 insertions(+), 15 deletions(-)
+ create mode 100644 apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
+ create mode 100644 apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
+
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
+new file mode 100644
+index 0000000000..b14b2c8cb6
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
+@@ -0,0 +1,164 @@
++import {
++  ProviderDriverKind,
++  ProviderInstanceId,
++  type ServerProvider,
++  type ServerProviderUsageLimits,
++  type UsageLimitSourceSnapshots,
++  UsageLimitSourceId,
++} from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import { resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
++
++const now = Date.parse("2026-11-02T22:00:00.000Z");
++const checkedAt = "2026-11-02T21:59:00.000Z";
++const HOUR = 60 * 60_000;
++const instanceId = ProviderInstanceId.make("claudeAgent");
++
++function limits(sessionUsed: number, weeklyUsed: number): ServerProviderUsageLimits {
++  return {
++    checkedAt,
++    windows: [
++      {
++        id: "five_hour",
++        kind: "session",
++        label: "Session",
++        usedPercent: sessionUsed,
++        resetsAt: new Date(now + 2 * HOUR).toISOString(),
++        windowDurationMins: 300,
++        checkedAt,
++      },
++      {
++        id: "seven_day",
++        kind: "weekly",
++        label: "Weekly",
++        usedPercent: weeklyUsed,
++        resetsAt: new Date(now + 40 * HOUR).toISOString(),
++        windowDurationMins: 7 * 24 * 60,
++        checkedAt,
++      },
++    ],
++  };
++}
++
++const probeFailed: ServerProviderUsageLimits = {
++  checkedAt,
++  windows: [],
++  unavailable: { reason: "probeFailed" },
++};
++
++function provider(
++  usageLimits: ServerProviderUsageLimits | undefined,
++  auth: ServerProvider["auth"],
++): ServerProvider {
++  return {
++    instanceId,
++    driver: ProviderDriverKind.make("claudeAgent"),
++    enabled: true,
++    installed: true,
++    version: "2.1.300",
++    status: "ready",
++    auth,
++    checkedAt,
++    models: [],
++    slashCommands: [],
++    skills: [],
++    ...(usageLimits ? { usageLimits } : {}),
++  };
++}
++
++const viaProxy = { status: "authenticated", type: "customEndpoint" } as const;
++const subscription = { status: "authenticated", type: "max" } as const;
++
++function proxySource(
++  accounts: ReadonlyArray<{ id: string; driver?: string; limits: ServerProviderUsageLimits }>,
++): UsageLimitSourceSnapshots {
++  return [
++    {
++      id: UsageLimitSourceId.make("hub"),
++      kind: "cliproxy",
++      label: "HUB",
++      checkedAt,
++      accounts: accounts.map((account) => ({
++        id: account.id,
++        driver: ProviderDriverKind.make(account.driver ?? "claudeAgent"),
++        email: `${account.id}@example.com`,
++        usageLimits: account.limits,
++      })),
++    },
++  ];
++}
++
++const threeAccounts = proxySource([
++  { id: "cs", limits: limits(0, 6) },
++  { id: "ds", limits: limits(0, 17) },
++  { id: "ts", limits: limits(0, 29) },
++]);
++
++describe("resolveThreadDetailsLimits", () => {
++  it("shows the instance's own limits when it can read them", () => {
++    const own = limits(30, 40);
++    expect(
++      resolveThreadDetailsLimits({
++        providerInstanceId: instanceId,
++        providers: [provider(own, subscription)],
++        sources: threeAccounts,
++        now,
++      }),
++    ).toEqual({ kind: "own", limits: own });
++  });
++
++  it("pools the proxy's accounts for an instance behind a custom endpoint", () => {
++    const result = resolveThreadDetailsLimits({
++      providerInstanceId: instanceId,
++      providers: [provider(probeFailed, viaProxy)],
++      sources: threeAccounts,
++      now,
++    });
++    expect(result?.kind).toBe("pooled");
++    if (result?.kind !== "pooled") return;
++    expect(result.accountCount).toBe(3);
++    expect(result.sourceLabel).toBe("CLI Proxy");
++    expect(result.windows.map((window) => [window.label, window.remainingPercent])).toEqual([
++      ["Session", 100],
++      ["Weekly", 83],
++    ]);
++  });
++
++  it("keeps a subscription's own failure instead of borrowing another login's limits", () => {
++    expect(
++      resolveThreadDetailsLimits({
++        providerInstanceId: instanceId,
++        providers: [provider(probeFailed, subscription)],
++        sources: threeAccounts,
++        now,
++      }),
++    ).toEqual({ kind: "notice", notice: "Could not read limits." });
++  });
++
++  it("reports the failure when the proxy has no usable account for the driver", () => {
++    const codexOnly = proxySource([{ id: "ds", driver: "codex", limits: limits(10, 60) }]);
++    const failedClaude = proxySource([{ id: "cs", limits: probeFailed }]);
++    for (const sources of [[], codexOnly, failedClaude]) {
++      expect(
++        resolveThreadDetailsLimits({
++          providerInstanceId: instanceId,
++          providers: [provider(probeFailed, viaProxy)],
++          sources,
++          now,
++        }),
++      ).toEqual({ kind: "notice", notice: "Could not read limits." });
++    }
++  });
++
++  it("returns nothing without a selected instance", () => {
++    expect(
++      resolveThreadDetailsLimits({
++        providerInstanceId: null,
++        providers: [provider(probeFailed, viaProxy)],
++        sources: threeAccounts,
++        now,
++      }),
++    ).toBeNull();
++  });
++});
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
+new file mode 100644
+index 0000000000..7b3c5b1a41
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
+@@ -0,0 +1,83 @@
++import type {
++  ProviderInstanceId,
++  ServerProvider,
++  ServerProviderUsageLimits,
++  UsageLimitSourceSnapshots,
++} from "@t3tools/contracts";
++import {
++  collectLimitPools,
++  collectProviderUsageLimits,
++  displayLimitWindows,
++  type LimitAccount,
++  type LimitPoolWindow,
++  limitsNotice,
++} from "@t3tools/shared/usageLimits";
++
++export type ThreadDetailsLimits =
++  | { readonly kind: "own"; readonly limits: ServerProviderUsageLimits }
++  | { readonly kind: "notice"; readonly notice: string }
++  | {
++      readonly kind: "pooled";
++      readonly windows: readonly LimitPoolWindow[];
++      readonly accountCount: number;
++      readonly sourceLabel: string;
++    };
++
++/**
++ * The limits the thread details card shows for one provider instance. An instance that talks to a
++ * custom endpoint (a CLI proxy) cannot read subscription limits itself, so the card falls back to
++ * the pooled limits of the proxy's accounts for the same driver, as the Usage page shows them.
++ */
++export function resolveThreadDetailsLimits(input: {
++  readonly providerInstanceId: ProviderInstanceId | null;
++  readonly providers: readonly ServerProvider[];
++  readonly sources: UsageLimitSourceSnapshots;
++  readonly now: number;
++}): ThreadDetailsLimits | null {
++  const { providerInstanceId, providers, sources, now } = input;
++  if (providerInstanceId === null) return null;
++  const provider = providers.find((candidate) => candidate.instanceId === providerInstanceId);
++  const report = collectProviderUsageLimits(providerInstanceId, providers, sources, now);
++  // Only this instance's data: other native entries may be a different login or workspace.
++  const own =
++    report?.accounts.find((entry) => entry.instanceId === providerInstanceId)?.limits ??
++    provider?.usageLimits;
++  const notice = own ? limitsNotice(own) : null;
++  if (own && notice === null) return { kind: "own", limits: own };
++
++  const routesThroughProxy = provider?.auth.type === "customEndpoint" || own === undefined;
++  const proxied = routesThroughProxy
++    ? (report?.accounts ?? []).filter(
++        (entry) =>
++          entry.instanceId === undefined &&
++          entry.sourceLabel !== undefined &&
++          limitsNotice(entry.limits) === null,
++      )
++    : [];
++  if (proxied.length > 0) {
++    const accounts = proxied.map(
++      (entry): LimitAccount => ({
++        key: entry.id,
++        driver: entry.driver,
++        displayName: entry.displayName ?? null,
++        email: entry.email,
++        plan: entry.plan,
++        accentColor: entry.accentColor,
++        environments: [],
++        sourceLabel: entry.sourceLabel ?? null,
++        redeem: null,
++        limits: entry.limits,
++      }),
++    );
++    const pool = collectLimitPools(accounts, now)[0];
++    if (pool && pool.windows.length > 0) {
++      return {
++        kind: "pooled",
++        windows: displayLimitWindows(pool),
++        accountCount: accounts.length,
++        sourceLabel: proxied[0]!.sourceLabel!,
++      };
++    }
++  }
++  return own && notice !== null ? { kind: "notice", notice } : null;
++}
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+index 05211d6ace..afce18bc4f 100644
+--- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+@@ -5,10 +5,9 @@ import type {
+   UsageLimitSourceSnapshots,
+ } from "@t3tools/contracts";
+ import {
+-  collectProviderUsageLimits,
+   formatDuration,
+   type LimitPace,
+-  limitsNotice,
++  type LimitPoolWindow,
+   paceOf,
+   remainingPercent,
+ } from "@t3tools/shared/usageLimits";
+@@ -22,6 +21,7 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+ import { ThreadDetailsSection } from "./ThreadDetailsSection";
++import { resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
+ 
+ const PACE_LABEL: Record<LimitPace, string> = {
+   ahead: "Ahead of pace",
+@@ -46,17 +46,8 @@ export function ThreadDetailsUsage({
+ }: Omit<ThreadDetailsUsageInput, "contextWindow">) {
+   const nowMinute = useNowMinute();
+   const now = Date.parse(`${nowMinute}:00Z`);
+-  const report =
+-    providerInstanceId !== null
+-      ? collectProviderUsageLimits(providerInstanceId, providers, sources, now)
+-      : null;
+-  // Only this instance's data: the report keeps one instance per login, and any other entry may be
+-  // a different login or workspace, so fall back to the instance's own snapshot.
+-  const limits =
+-    report?.accounts.find((entry) => entry.instanceId === providerInstanceId)?.limits ??
+-    providers.find((provider) => provider.instanceId === providerInstanceId)?.usageLimits;
++  const limits = resolveThreadDetailsLimits({ providerInstanceId, providers, sources, now });
+   if (!limits) return null;
+-  const notice = limitsNotice(limits);
+ 
+   return (
+     <ThreadDetailsSection
+@@ -65,16 +56,28 @@ export function ThreadDetailsUsage({
+       showHeading={false}
+     >
+       <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
+-        {notice ? (
++        {limits.kind === "notice" ? (
+           <UsageRow
+             label="Limits"
+             fill={null}
+             tone={null}
+             value="Unavailable"
+-            tooltip={<span className="text-foreground">{notice}</span>}
++            tooltip={<span className="text-foreground">{limits.notice}</span>}
+           />
++        ) : limits.kind === "pooled" ? (
++          limits.windows.map((window) => (
++            <PooledLimitRow
++              key={window.id}
++              window={window}
++              now={now}
++              accountCount={limits.accountCount}
++              sourceLabel={limits.sourceLabel}
++            />
++          ))
+         ) : (
+-          limits.windows.map((window) => <LimitRow key={window.id} window={window} now={now} />)
++          limits.limits.windows.map((window) => (
++            <LimitRow key={window.id} window={window} now={now} />
++          ))
+         )}
+       </div>
+     </ThreadDetailsSection>
+@@ -173,6 +176,52 @@ function LimitRow({
+   );
+ }
+ 
++/** A window pooled across a proxy's accounts; it reads like the Usage page's summary. */
++function PooledLimitRow({
++  window,
++  now,
++  accountCount,
++  sourceLabel,
++}: {
++  readonly window: LimitPoolWindow;
++  readonly now: number;
++  readonly accountCount: number;
++  readonly sourceLabel: string;
++}) {
++  const timestampFormat = usePrimarySettings((settings) => settings.timestampFormat);
++  const left = window.remainingPercent;
++  const nextReset = window.resets.find((reset) => reset.at > now);
++  return (
++    <UsageRow
++      label={window.label}
++      fill={left}
++      tone={left <= 10 ? "error" : left <= 20 ? "warning" : null}
++      value={`${left}%`}
++      ariaValue={`${left}% left across ${accountCount} accounts`}
++      tooltip={
++        <>
++          <span className="text-foreground">
++            {window.label}: {left}% left
++          </span>
++          <span className="text-muted-foreground">
++            Pooled across {accountCount} {accountCount === 1 ? "account" : "accounts"} from{" "}
++            {sourceLabel}
++          </span>
++          {nextReset ? (
++            <span className="text-muted-foreground">
++              Next reset in {formatDuration(nextReset.at - now)} ·{" "}
++              {formatUpcomingTimestamp(new Date(nextReset.at).toISOString(), timestampFormat, now)}
++            </span>
++          ) : null}
++          {window.pace ? (
++            <span className="text-muted-foreground">{PACE_LABEL[window.pace]}</span>
++          ) : null}
++        </>
++      }
++    />
++  );
++}
++
+ /** One label, hairline, and value row; the whole row opens the details tooltip. */
+ function UsageRow({
+   label,
