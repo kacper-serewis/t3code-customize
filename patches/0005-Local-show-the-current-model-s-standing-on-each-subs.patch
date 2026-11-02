@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:11:58 +0200
-Subject: [PATCH 5/7] Local: show the current model's standing on each
+Subject: [PATCH 5/9] Local: show the current model's standing on each
  subscription in the limits popover
 
 ---
@@ -11,12 +11,12 @@ Subject: [PATCH 5/7] Local: show the current model's standing on each
  3 files changed, 121 insertions(+), 2 deletions(-)
 
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 4a4b72fcd..3959ec97e 100644
+index 0b6c6b4ce0..4c341942a1 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -28,7 +28,7 @@ import {
-   deriveTurnElapsedMs,
    selectComposerLimitWindows,
+   type RecordedCompaction,
  } from "./ComposerStats.logic";
 -import { recommendSubscriptionSwitch } from "./SubscriptionSwitch.logic";
 +import { recommendSubscriptionSwitch, subscriptionStandings } from "./SubscriptionSwitch.logic";
@@ -103,7 +103,7 @@ index 4a4b72fcd..3959ec97e 100644
        {subscriptionSwitch && <SubscriptionSwitchChip {...subscriptionSwitch} />}
        {stats.length > 0 && (
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
-index da5f1aa6e..be9c04001 100644
+index da5f1aa6e4..be9c040019 100644
 --- a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 @@ -7,6 +7,7 @@ import { describe, expect, it } from "vite-plus/test";
@@ -142,7 +142,7 @@ index da5f1aa6e..be9c04001 100644
 +  });
 +});
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
-index af475f0b2..6557fdbc0 100644
+index af475f0b2a..6557fdbc01 100644
 --- a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -223,3 +223,48 @@ export function recommendSubscriptionSwitch(input: {
