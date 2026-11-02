@@ -18,7 +18,9 @@
     "apps/server/src/provider/codexUsageLimits.test.ts",
     "apps/web/src/components/chat/ModelPickerUsage.logic.test.ts",
     "apps/server/src/usage/usageLimitsHttp.test.ts",
-    "apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts"
+    "apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts",
+    "apps/server/src/usage/cliproxyObservability.test.ts",
+    "apps/web/src/components/usage/proxyObservability.test.ts"
   ],
   "typecheck": [
     "apps/server",

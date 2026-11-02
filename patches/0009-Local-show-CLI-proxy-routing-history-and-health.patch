@@ -1,0 +1,2029 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Mon, 2 Nov 2026 23:37:37 +0100
+Subject: [PATCH 9/9] Local: show CLI proxy routing, history and health
+
+A CLIProxyAPI fork serves routing, quota-history and fork-status endpoints beside
+the stock management API. The server now reads them with each source refresh
+(routing every minute) and adds trimmed fields to the source snapshot: main
+chat sessions without titles, the queue for the next new chat, hourly usage
+per account for a week, and failed updaters or stopped jobs. Stock proxies
+answer 404 and are unaffected.
+
+- Thread details name the proxy account serving the chat and show that
+  account's limits, or before the first turn the account a new chat gets,
+  with the proxy's reasoning in the tooltip.
+- A composer notice appears for 30 minutes after the proxy moves a chat to
+  another account, since that rebuilds its prompt cache.
+- The Usage page draws a week of history per account, with the proxy's
+  reserve, and marks the account that gets the next chat.
+- Failed proxy updaters and stopped jobs appear among the Usage notices.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/server/src/usage/UsageLimitSources.ts    |  68 ++++-
+ apps/server/src/usage/cliproxyApi.ts          |  26 +-
+ .../src/usage/cliproxyObservability.test.ts   | 209 +++++++++++++++
+ .../server/src/usage/cliproxyObservability.ts | 241 ++++++++++++++++++
+ apps/web/src/components/ChatView.tsx          |  12 +-
+ .../src/components/chat/ProxySwitchBanner.tsx |  37 +++
+ .../chat/ThreadDetailsUsage.logic.test.ts     | 130 +++++++++-
+ .../chat/ThreadDetailsUsage.logic.ts          | 104 +++++---
+ .../components/chat/ThreadDetailsUsage.tsx    |  96 ++++++-
+ .../components/usage/UsageLimitsPooled.tsx    |  98 +++++--
+ .../src/components/usage/UsageSparkline.tsx   | 155 +++++++++++
+ .../usage/proxyObservability.test.ts          | 140 ++++++++++
+ .../components/usage/proxyObservability.ts    | 103 ++++++++
+ apps/web/src/lib/proxyRouting.ts              | 113 ++++++++
+ packages/contracts/src/providerUsageLimits.ts |  96 +++++++
+ 15 files changed, 1550 insertions(+), 78 deletions(-)
+ create mode 100644 apps/server/src/usage/cliproxyObservability.test.ts
+ create mode 100644 apps/server/src/usage/cliproxyObservability.ts
+ create mode 100644 apps/web/src/components/chat/ProxySwitchBanner.tsx
+ create mode 100644 apps/web/src/components/usage/UsageSparkline.tsx
+ create mode 100644 apps/web/src/components/usage/proxyObservability.test.ts
+ create mode 100644 apps/web/src/components/usage/proxyObservability.ts
+ create mode 100644 apps/web/src/lib/proxyRouting.ts
+
+diff --git a/apps/server/src/usage/UsageLimitSources.ts b/apps/server/src/usage/UsageLimitSources.ts
+index 7a068cde85..026f2fe0dc 100644
+--- a/apps/server/src/usage/UsageLimitSources.ts
++++ b/apps/server/src/usage/UsageLimitSources.ts
+@@ -46,12 +46,34 @@ function sourceLabel(id: string, config: UsageLimitSourceConfig): string {
+   }
+ }
+ 
++const OBSERVABILITY_INTERVAL = Duration.seconds(60);
++
++type Observability = Pick<UsageLimitSourceSnapshot, "routing" | "history" | "health">;
++
++function withObservability(
++  snapshot: UsageLimitSourceSnapshot,
++  observed: { readonly [K in keyof Observability]: Observability[K] | undefined },
++): UsageLimitSourceSnapshot {
++  const { routing: _routing, history: _history, health: _health, ...rest } = snapshot;
++  return {
++    ...rest,
++    ...(observed.routing ? { routing: observed.routing } : {}),
++    ...(observed.history ? { history: observed.history } : {}),
++    ...(observed.health ? { health: observed.health } : {}),
++  };
++}
++
++const observes = (observed: Observability) =>
++  observed.routing !== undefined || observed.history !== undefined || observed.health !== undefined;
++
+ /** @public */
+ export const make = Effect.gen(function* () {
+   const api = yield* makeCliproxyApi;
+   const settingsService = yield* Settings.ServerSettingsService;
+   const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
+   const stateRef = yield* Ref.make<ReadonlyArray<UsageLimitSourceSnapshot>>([]);
++  // Sources whose proxy serves no observability endpoints; cleared by each full refresh.
++  const withoutObservability = new Set<UsageLimitSourceId>();
+   const changes = yield* Effect.acquireRelease(
+     PubSub.unbounded<ReadonlyArray<UsageLimitSourceSnapshot>>(),
+     PubSub.shutdown,
+@@ -66,12 +88,17 @@ export const make = Effect.gen(function* () {
+     if (config.managementKey.length === 0) {
+       return { ...base, accounts: [], error: "No management key configured." };
+     }
+-    const accounts = yield* api.readAccounts(config).pipe(Effect.result);
++    const [accounts, observed] = yield* Effect.all(
++      [api.readAccounts(config).pipe(Effect.result), api.readObservability(config)],
++      { concurrency: 2 },
++    );
++    if (observes(observed)) withoutObservability.delete(id);
++    else withoutObservability.add(id);
+     if (accounts._tag === "Failure") {
+       yield* Effect.logDebug("usage limit source read failed", { id, cause: accounts.failure });
+-      return { ...base, accounts: [], error: accounts.failure.detail };
++      return withObservability({ ...base, accounts: [], error: accounts.failure.detail }, observed);
+     }
+-    return { ...base, accounts: accounts.success };
++    return withObservability({ ...base, accounts: accounts.success }, observed);
+   });
+ 
+   const publish = Effect.fn("UsageLimitSources.publish")(function* (
+@@ -100,6 +127,33 @@ export const make = Effect.gen(function* () {
+     yield* publish(snapshots);
+   }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
+ 
++  // Routing moves within minutes, so it refreshes more often than the account reads.
++  const refreshObservability = Effect.gen(function* () {
++    const settings = yield* settingsService.getSettings.pipe(
++      Effect.orElseSucceed((): ServerSettings | null => null),
++    );
++    const sources = settings?.usageLimitSources ?? {};
++    const current = yield* Ref.get(stateRef);
++    const next = yield* Effect.forEach(
++      current,
++      (snapshot) => {
++        const config = sources[snapshot.id];
++        if (!config?.enabled || !config.managementKey || withoutObservability.has(snapshot.id)) {
++          return Effect.succeed(snapshot);
++        }
++        return api
++          .readObservability(config)
++          .pipe(
++            Effect.map((observed) =>
++              observes(observed) ? withObservability(snapshot, observed) : snapshot,
++            ),
++          );
++      },
++      { concurrency: 4 },
++    );
++    yield* publish(next);
++  }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
++
+   // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
+   const consumeResetCredit = Effect.fn("UsageLimitSources.consumeResetCredit")(function* (
+     input: UsageLimitSourceConsumeResetCreditInput,
+@@ -147,6 +201,14 @@ export const make = Effect.gen(function* () {
+     ),
+   ).pipe(Effect.forkScoped);
+ 
++  yield* Effect.forever(
++    Effect.sleep(OBSERVABILITY_INTERVAL).pipe(
++      Effect.andThen(backgroundPolicy.shouldRunScopeWork({ type: "provider-status" })),
++      Effect.flatMap((shouldRun) => (shouldRun ? refreshObservability : Effect.void)),
++      Effect.ignoreCause({ log: true }),
++    ),
++  ).pipe(Effect.forkScoped);
++
+   yield* refresh.pipe(Effect.forkScoped);
+ 
+   return {
+diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
+index 29bdfe118c..2aa30d21e8 100644
+--- a/apps/server/src/usage/cliproxyApi.ts
++++ b/apps/server/src/usage/cliproxyApi.ts
+@@ -17,6 +17,7 @@ import { codexPlanLabel } from "../provider/CodexProvider.ts";
+ import { codexRateLimitsToLimits } from "../provider/codexUsageLimits.ts";
+ import { claudeUsageResponseToLimits } from "../provider/claudeUsageLimits.ts";
+ import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
++import { toHealth, toHistory, toRouting } from "./cliproxyObservability.ts";
+ 
+ const AuthFile = Schema.Struct({
+   id: Schema.String,
+@@ -176,11 +177,12 @@ export const makeCliproxyApi = Effect.gen(function* () {
+     config: UsageLimitSourceConfig,
+     path: string,
+     body?: unknown,
++    apiVersion: "v0" | "v8" = "v0",
+   ) {
+     const url = yield* Effect.try({
+       try: () =>
+         new URL(
+-          `v0/management/${path}`,
++          `${apiVersion}/management/${path}`,
+           config.url.endsWith("/") ? config.url : `${config.url}/`,
+         ).toString(),
+       catch: () => new UsageLimitSourceError({ detail: "The hub URL is not valid." }),
+@@ -438,5 +440,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
+       ),
+     );
+   });
+-  return { readAccounts, consume };
++  /** The fork's observability data; each part is undefined when the proxy does not serve it. */
++  const readObservability = Effect.fn("CliproxyApi.readObservability")(function* (
++    config: UsageLimitSourceConfig,
++  ) {
++    const read = (path: string) =>
++      management(config, `observability/${path}`, undefined, "v8").pipe(
++        Effect.orElseSucceed(() => undefined),
++      );
++    const [routing, history, fork] = yield* Effect.all(
++      [read("routing"), read("quota-history"), read("fork")],
++      { concurrency: 3 },
++    );
++    const nowSeconds = Math.floor(DateTime.toEpochMillis(yield* DateTime.now) / 1000);
++    return {
++      routing: toRouting(routing),
++      history: toHistory(history, nowSeconds),
++      health: toHealth(fork),
++    };
++  });
++
++  return { readAccounts, consume, readObservability };
+ });
+diff --git a/apps/server/src/usage/cliproxyObservability.test.ts b/apps/server/src/usage/cliproxyObservability.test.ts
+new file mode 100644
+index 0000000000..ae9b8d6416
+--- /dev/null
++++ b/apps/server/src/usage/cliproxyObservability.test.ts
+@@ -0,0 +1,209 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { toHealth, toHistory, toRouting } from "./cliproxyObservability.ts";
++
++describe("toRouting", () => {
++  it("keeps main sessions without titles and maps providers to drivers", () => {
++    const routing = toRouting({
++      sessions: [
++        {
++          id: "claude:abc",
++          client: "claude",
++          agent: "main",
++          title: "first prompt text",
++          provider: "claude",
++          auth: "home.json",
++          model: "claude-opus-5-5",
++          requests: 12,
++          first_seen: "2026-11-02T20:00:00+01:00",
++          last_seen: "2026-11-02T21:00:00+01:00",
++          switches: [{ at: "2026-11-02T20:30:00+01:00", from: "home.json", to: "spare.json" }],
++        },
++        {
++          id: "claude:abc-sub",
++          agent: "a1b2c3",
++          provider: "claude",
++          auth: "home.json",
++          model: "claude-haiku-5-5",
++          requests: 1,
++          first_seen: "2026-11-02T20:00:00+01:00",
++          last_seen: "2026-11-02T20:00:00+01:00",
++        },
++        { id: "lcp:x", provider: "gemini", auth: "g.json", first_seen: "x", last_seen: "y" },
++      ],
++      next: {
++        claude: [
++          {
++            auth: "home.json",
++            unavailable: false,
++            saturated: false,
++            retry_after: "0001-01-01T00:00:00Z",
++            adaptive: {
++              reason: "home",
++              home: true,
++              fresh: true,
++              eligible: true,
++              draining: false,
++              short: { used: 0.1, reserve: 0.2, spare: 0.7, forecast: 0.15, learning: true },
++              long: {
++                used: 0.4,
++                reserve: 0.5,
++                spare: 0.1,
++                forecast: 0.47,
++                reset: "2026-11-07T22:00:00+01:00",
++              },
++            },
++          },
++        ],
++        codex: [{ auth: "codex.json", unavailable: true, saturated: false }],
++        gemini: [{ auth: "g.json" }],
++      },
++    });
++
++    expect(routing).toEqual({
++      sessions: [
++        {
++          id: "claude:abc",
++          client: "claude",
++          agent: "main",
++          driver: "claudeAgent",
++          accountId: "home.json",
++          model: "claude-opus-5-5",
++          requests: 12,
++          firstSeen: "2026-11-02T19:00:00.000Z",
++          lastSeen: "2026-11-02T20:00:00.000Z",
++          switches: [{ at: "2026-11-02T19:30:00.000Z", from: "home.json", to: "spare.json" }],
++        },
++      ],
++      next: [
++        {
++          driver: "claudeAgent",
++          candidates: [
++            {
++              accountId: "home.json",
++              unavailable: false,
++              saturated: false,
++              adaptive: {
++                reason: "home",
++                home: true,
++                fresh: true,
++                eligible: true,
++                draining: false,
++                short: {
++                  used: 0.1,
++                  reserve: 0.2,
++                  spare: 0.7,
++                  forecast: 0.15,
++                  learning: true,
++                  inactive: false,
++                },
++                long: {
++                  used: 0.4,
++                  reserve: 0.5,
++                  spare: 0.1,
++                  forecast: 0.47,
++                  learning: false,
++                  inactive: false,
++                  reset: "2026-11-07T21:00:00.000Z",
++                },
++              },
++            },
++          ],
++        },
++        {
++          driver: "codex",
++          candidates: [{ accountId: "codex.json", unavailable: true, saturated: false }],
++        },
++      ],
++    });
++  });
++
++  it("returns nothing for a stock proxy's response", () => {
++    expect(toRouting(undefined)).toBeUndefined();
++    expect(toRouting({ error: "not found" })).toBeUndefined();
++  });
++});
++
++describe("toHistory", () => {
++  const now = 1_793_700_000;
++
++  it("keeps the latest reading per hour for the last week as percentages", () => {
++    const hour = Math.floor(now / 3600) * 3600;
++    const history = toHistory(
++      {
++        points: [
++          { t: now - 8 * 24 * 3600, auth: "a.json", long_used: 0.9 },
++          { t: hour + 10, auth: "a.json", short_used: 0.1, long_used: 0.3 },
++          { t: hour + 20, auth: "a.json", long_used: 0.31 },
++          { t: hour - 100, auth: "a.json", short_used: 0.05, long_used: 0.29 },
++          { t: hour + 5, auth: "b.json", short_used: 1.4 },
++          { t: hour + 5, auth: "c.json" },
++        ],
++      },
++      now,
++    );
++    expect(history).toEqual([
++      {
++        accountId: "a.json",
++        points: [
++          { at: hour - 100, short: 5, long: 29 },
++          { at: hour + 20, short: 10, long: 31 },
++        ],
++      },
++      { accountId: "b.json", points: [{ at: hour + 5, short: 100 }] },
++    ]);
++  });
++
++  it("returns nothing without a points array", () => {
++    expect(toHistory({}, now)).toBeUndefined();
++  });
++});
++
++describe("toHealth", () => {
++  it("reports the latest failed run per component, stopped jobs and pending updates", () => {
++    expect(
++      toHealth({
++        running: { version: "8.0.51-soonest-reset" },
++        status: {
++          repos: [
++            { name: "proxy", base_tag: "v8.0.51", latest_tag: "v8.0.52" },
++            { name: "panel", base_tag: "v1.27.2", latest_tag: "v1.27.2" },
++          ],
++          runs: [
++            {
++              at: "2026-11-02T22:00:00Z",
++              component: "panel",
++              outcome: "failed",
++              step: "preflight",
++              detail: "dirty tree",
++            },
++            { at: "2026-11-02T21:00:00Z", component: "panel", outcome: "updated" },
++            { at: "2026-11-02T20:00:00Z", component: "proxy", outcome: "failed" },
++            { at: "2026-11-02T22:30:00Z", component: "proxy", outcome: "up-to-date" },
++          ],
++          services: [
++            { label: "local.ok", pid: 10, last_exit: 0 },
++            { label: "local.interval", last_exit: 0 },
++            { label: "local.crashed", last_exit: 78 },
++          ],
++        },
++      }),
++    ).toEqual({
++      version: "8.0.51-soonest-reset",
++      updateAvailable: "proxy v8.0.52",
++      failedRuns: [
++        {
++          at: "2026-11-02T22:00:00.000Z",
++          component: "panel",
++          step: "preflight",
++          detail: "dirty tree",
++        },
++      ],
++      stoppedServices: ["local.crashed"],
++    });
++  });
++
++  it("returns nothing for a stock proxy", () => {
++    expect(toHealth(undefined)).toBeUndefined();
++  });
++});
+diff --git a/apps/server/src/usage/cliproxyObservability.ts b/apps/server/src/usage/cliproxyObservability.ts
+new file mode 100644
+index 0000000000..b98a2b1cb2
+--- /dev/null
++++ b/apps/server/src/usage/cliproxyObservability.ts
+@@ -0,0 +1,241 @@
++/**
++ * Reads the observability endpoints a CLIProxyAPI fork serves beside the stock management API:
++ * per-chat routing, the queue for the next new chat, quota history and the fork's own health.
++ * Stock proxies answer 404, so every reader here is optional and tolerant of missing fields.
++ * Chat titles hold the first prompt and are never copied.
++ */
++import {
++  ProviderDriverKind,
++  type UsageLimitSourceAdaptiveWindow,
++  type UsageLimitSourceHealth,
++  type UsageLimitSourceHistory,
++  type UsageLimitSourceRouting,
++  type UsageLimitSourceRoutingCandidate,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++
++const HISTORY_SECONDS = 7 * 24 * 3600;
++const HISTORY_BUCKET_SECONDS = 3600;
++const MAX_FAILED_RUN_DETAIL = 240;
++
++type Json = Record<string, unknown>;
++
++const record = (value: unknown): Json | undefined =>
++  typeof value === "object" && value !== null && !Array.isArray(value)
++    ? (value as Json)
++    : undefined;
++const list = (value: unknown): readonly unknown[] => (Array.isArray(value) ? value : []);
++const text = (value: unknown): string | undefined =>
++  typeof value === "string" && value.trim() !== "" ? value : undefined;
++const number = (value: unknown): number | undefined =>
++  typeof value === "number" && Number.isFinite(value) ? value : undefined;
++const bool = (value: unknown): boolean => value === true;
++
++/** Go encodes an unset time as year 1; drop it and anything unparseable. */
++function isoTime(value: unknown): string | undefined {
++  const raw = text(value);
++  if (!raw || raw.startsWith("0001-")) return undefined;
++  const ms = Date.parse(raw);
++  return Number.isFinite(ms) ? DateTime.formatIso(DateTime.makeUnsafe(ms)) : undefined;
++}
++
++function driverForProvider(provider: string | undefined): ProviderDriverKind | undefined {
++  if (provider === "claude") return ProviderDriverKind.make("claudeAgent");
++  if (provider === "codex") return ProviderDriverKind.make("codex");
++  return undefined;
++}
++
++function adaptiveWindow(value: unknown): UsageLimitSourceAdaptiveWindow | undefined {
++  const window = record(value);
++  if (!window) return undefined;
++  const used = number(window.used);
++  const reserve = number(window.reserve);
++  const spare = number(window.spare);
++  const forecast = number(window.forecast);
++  if (used === undefined || reserve === undefined || spare === undefined) return undefined;
++  const reset = isoTime(window.reset);
++  return {
++    used,
++    reserve,
++    spare,
++    forecast: forecast ?? 0,
++    learning: bool(window.learning),
++    inactive: bool(window.inactive),
++    ...(reset ? { reset } : {}),
++  };
++}
++
++function routingCandidate(value: unknown): UsageLimitSourceRoutingCandidate | undefined {
++  const candidate = record(value);
++  const accountId = text(candidate?.auth);
++  if (!candidate || !accountId) return undefined;
++  const adaptive = record(candidate.adaptive);
++  const retryAfter = isoTime(candidate.retry_after);
++  const short = adaptiveWindow(adaptive?.short);
++  const long = adaptiveWindow(adaptive?.long);
++  return {
++    accountId,
++    unavailable: bool(candidate.unavailable),
++    saturated: bool(candidate.saturated),
++    ...(retryAfter ? { retryAfter } : {}),
++    ...(adaptive
++      ? {
++          adaptive: {
++            reason: text(adaptive.reason) ?? "",
++            home: bool(adaptive.home),
++            fresh: bool(adaptive.fresh),
++            eligible: bool(adaptive.eligible),
++            draining: bool(adaptive.draining),
++            ...(short ? { short } : {}),
++            ...(long ? { long } : {}),
++          },
++        }
++      : {}),
++  };
++}
++
++export function toRouting(raw: unknown): UsageLimitSourceRouting | undefined {
++  const body = record(raw);
++  if (!body || !Array.isArray(body.sessions)) return undefined;
++  const sessions = list(body.sessions).flatMap((value) => {
++    const session = record(value);
++    const id = text(session?.id);
++    const accountId = text(session?.auth);
++    const driver = driverForProvider(text(session?.provider));
++    const firstSeen = isoTime(session?.first_seen);
++    const lastSeen = isoTime(session?.last_seen);
++    if (!session || !id || !accountId || !driver || !firstSeen || !lastSeen) return [];
++    // Threads map to main sessions only; subagents and one-off calls would only add weight.
++    const sessionAgent = text(session.agent);
++    if (sessionAgent !== undefined && sessionAgent !== "main") return [];
++    const switches = list(session.switches).flatMap((entry) => {
++      const change = record(entry);
++      const at = isoTime(change?.at);
++      const from = text(change?.from);
++      const to = text(change?.to);
++      return at && from && to ? [{ at, from, to }] : [];
++    });
++    const client = text(session.client);
++    const agent = text(session.agent);
++    const parent = text(session.parent);
++    return [
++      {
++        id,
++        driver,
++        accountId,
++        model: text(session.model) ?? "",
++        requests: Math.max(0, Math.trunc(number(session.requests) ?? 0)),
++        firstSeen,
++        lastSeen,
++        switches,
++        ...(client ? { client } : {}),
++        ...(agent ? { agent } : {}),
++        ...(parent ? { parent } : {}),
++      },
++    ];
++  });
++  const nextByProvider = record(body.next) ?? {};
++  const next = Object.entries(nextByProvider).flatMap(([provider, candidates]) => {
++    const driver = driverForProvider(provider);
++    if (!driver) return [];
++    return [{ driver, candidates: list(candidates).flatMap((c) => routingCandidate(c) ?? []) }];
++  });
++  return { sessions, next };
++}
++
++/** One point per account and hour for the last week, keeping the hour's latest reading. */
++export function toHistory(raw: unknown, nowSeconds: number): UsageLimitSourceHistory | undefined {
++  const body = record(raw);
++  if (!body || !Array.isArray(body.points)) return undefined;
++  const since = nowSeconds - HISTORY_SECONDS;
++  const byAccount = new Map<string, Map<number, { at: number; short?: number; long?: number }>>();
++  for (const value of body.points) {
++    const point = record(value);
++    const accountId = text(point?.auth);
++    const at = number(point?.t);
++    if (!point || !accountId || at === undefined || at < since || at > nowSeconds + 60) continue;
++    const short = number(point.short_used);
++    const long = number(point.long_used);
++    if (short === undefined && long === undefined) continue;
++    const bucket = Math.floor(at / HISTORY_BUCKET_SECONDS);
++    const buckets = byAccount.get(accountId) ?? new Map();
++    byAccount.set(accountId, buckets);
++    const previous = buckets.get(bucket);
++    if (previous && previous.at > at) continue;
++    // A reading may omit one window; keep the hour's other value rather than dropping it.
++    buckets.set(bucket, {
++      at: Math.trunc(at),
++      ...(short !== undefined
++        ? { short: percent(short) }
++        : previous?.short !== undefined
++          ? { short: previous.short }
++          : {}),
++      ...(long !== undefined
++        ? { long: percent(long) }
++        : previous?.long !== undefined
++          ? { long: previous.long }
++          : {}),
++    });
++  }
++  return [...byAccount].map(([accountId, buckets]) => ({
++    accountId,
++    points: [...buckets.values()].sort((left, right) => left.at - right.at),
++  }));
++}
++
++function percent(share: number): number {
++  return Math.round(Math.max(0, Math.min(1, share)) * 1000) / 10;
++}
++
++/** Only what needs attention: the latest run per component when it failed, and stopped jobs. */
++export function toHealth(raw: unknown): UsageLimitSourceHealth | undefined {
++  const body = record(raw);
++  const status = record(body?.status);
++  if (!body || !status) return undefined;
++  const version = text(record(body.running)?.version);
++  const updates = list(status.repos).flatMap((value) => {
++    const repo = record(value);
++    const name = text(repo?.name);
++    const base = text(repo?.base_tag);
++    const latest = text(repo?.latest_tag);
++    return name && base && latest && base !== latest ? [`${name} ${latest}`] : [];
++  });
++  const latestRun = new Map<string, Json>();
++  for (const value of list(status.runs)) {
++    const run = record(value);
++    const component = text(run?.component);
++    const at = isoTime(run?.at);
++    if (!run || !component || !at) continue;
++    const previous = latestRun.get(component);
++    if (!previous || Date.parse(at) > Date.parse(isoTime(previous.at)!)) {
++      latestRun.set(component, run);
++    }
++  }
++  const failedRuns = [...latestRun].flatMap(([component, run]) => {
++    if (run.outcome !== "failed") return [];
++    const step = text(run.step);
++    const detail = text(run.detail)?.slice(0, MAX_FAILED_RUN_DETAIL);
++    return [
++      {
++        at: isoTime(run.at)!,
++        component,
++        ...(step ? { step } : {}),
++        ...(detail ? { detail } : {}),
++      },
++    ];
++  });
++  const stoppedServices = list(status.services).flatMap((value) => {
++    const service = record(value);
++    const label = text(service?.label);
++    const lastExit = number(service?.last_exit);
++    return label && number(service?.pid) === undefined && lastExit !== undefined && lastExit !== 0
++      ? [label]
++      : [];
++  });
++  return {
++    failedRuns,
++    stoppedServices,
++    ...(version ? { version } : {}),
++    ...(updates.length > 0 ? { updateAvailable: updates.join(", ") } : {}),
++  };
++}
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index b1448ca05b..92705b525d 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -313,6 +313,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
+ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
+ import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+ import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
++import { useProxySwitchBanner } from "./chat/ProxySwitchBanner";
+ import { ComposerStats } from "./chat/ComposerStats";
+ import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
+ import { ComposerSurface } from "./chat/ComposerSurface";
+@@ -2615,6 +2616,11 @@ export default function ChatView(props: ChatViewProps) {
+           },
+         })
+       : null;
++  const proxySwitchBanner = useProxySwitchBanner({
++    sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
++    driver: activeProviderStatus?.driver ?? null,
++    nativeSessionId: activeProviderThread?.nativeThreadRef?.nativeId ?? null,
++  });
+   const composerBannerItems = (() => {
+     const fallbackSelection = draftFallback?.selection;
+     const defaultSelection =
+@@ -2662,7 +2668,10 @@ export default function ChatView(props: ChatViewProps) {
+           ]
+         : [];
+     const limitRecoveryItems = limitRecoveryBanner === null ? [] : [limitRecoveryBanner];
+-    const usageLimitsItems = usageLimitsBanner === null ? [] : [usageLimitsBanner];
++    const usageLimitsItems = [
++      ...(usageLimitsBanner === null ? [] : [usageLimitsBanner]),
++      ...(proxySwitchBanner === null ? [] : [proxySwitchBanner]),
++    ];
+     const projectCloneItems = projectCloneBannerItem === null ? [] : [projectCloneBannerItem];
+     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
+       return [
+@@ -3992,6 +4001,7 @@ export default function ChatView(props: ChatViewProps) {
+                     providerInstanceId: activeProviderInstanceId,
+                     providers: providerStatuses,
+                     sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
++                    nativeSessionId: activeProviderThread?.nativeThreadRef?.nativeId ?? null,
+                     contextWindow: activeContextWindow,
+                   }}
+                 />
+diff --git a/apps/web/src/components/chat/ProxySwitchBanner.tsx b/apps/web/src/components/chat/ProxySwitchBanner.tsx
+new file mode 100644
+index 0000000000..660b6e676e
+--- /dev/null
++++ b/apps/web/src/components/chat/ProxySwitchBanner.tsx
+@@ -0,0 +1,37 @@
++import type { ProviderDriverKind, UsageLimitSourceSnapshots } from "@t3tools/contracts";
++import { formatDuration } from "@t3tools/shared/usageLimits";
++import { ArrowRightLeftIcon } from "lucide-react";
++import { useState } from "react";
++
++import { useNowMinute } from "../../hooks/useNowMinute";
++import { findProxySession, isRecentSwitch } from "../../lib/proxyRouting";
++import type { ComposerBannerStackItem } from "./ComposerBannerStack";
++
++/**
++ * A notice above the composer when the CLI proxy recently moved this chat to another account,
++ * since the move costs the chat its prompt cache once. Dismissing it hides that one switch.
++ */
++export function useProxySwitchBanner(input: {
++  readonly sources: UsageLimitSourceSnapshots;
++  readonly driver: ProviderDriverKind | null;
++  readonly nativeSessionId: string | null;
++}): ComposerBannerStackItem | null {
++  const nowMinute = useNowMinute();
++  const [dismissed, setDismissed] = useState<string | null>(null);
++  const now = Date.parse(`${nowMinute}:00Z`);
++  const route = input.driver
++    ? findProxySession(input.sources, input.driver, input.nativeSessionId)
++    : null;
++  if (!route || !route.lastSwitch || !isRecentSwitch(route, now)) return null;
++  const key = `${route.session.id}:${route.lastSwitch.at}`;
++  if (dismissed === key) return null;
++  return {
++    id: `proxy-switch:${key}`,
++    variant: "info",
++    icon: <ArrowRightLeftIcon />,
++    title: `${route.source.label} moved this chat from ${route.lastSwitch.from.label} to ${route.account.label}`,
++    description: `${formatDuration(Math.max(0, now - route.lastSwitch.at))} ago. The prompt cache is rebuilt once on the new account.`,
++    dismissLabel: "Dismiss account switch notice",
++    onDismiss: () => setDismissed(key),
++  };
++}
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
+index b14b2c8cb6..75411523b3 100644
+--- a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
+@@ -8,7 +8,7 @@ import {
+ } from "@t3tools/contracts";
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
++import { resolveThreadDetailsUsage } from "./ThreadDetailsUsage.logic";
+ 
+ const now = Date.parse("2026-11-02T22:00:00.000Z");
+ const checkedAt = "2026-11-02T21:59:00.000Z";
+@@ -95,21 +95,23 @@ const threeAccounts = proxySource([
+   { id: "ts", limits: limits(0, 29) },
+ ]);
+ 
+-describe("resolveThreadDetailsLimits", () => {
++describe("resolveThreadDetailsUsage", () => {
+   it("shows the instance's own limits when it can read them", () => {
+     const own = limits(30, 40);
+     expect(
+-      resolveThreadDetailsLimits({
++      resolveThreadDetailsUsage({
++        nativeSessionId: "unrouted",
+         providerInstanceId: instanceId,
+         providers: [provider(own, subscription)],
+         sources: threeAccounts,
+         now,
+-      }),
++      }).limits,
+     ).toEqual({ kind: "own", limits: own });
+   });
+ 
+   it("pools the proxy's accounts for an instance behind a custom endpoint", () => {
+-    const result = resolveThreadDetailsLimits({
++    const { limits: result } = resolveThreadDetailsUsage({
++      nativeSessionId: "unrouted",
+       providerInstanceId: instanceId,
+       providers: [provider(probeFailed, viaProxy)],
+       sources: threeAccounts,
+@@ -127,12 +129,13 @@ describe("resolveThreadDetailsLimits", () => {
+ 
+   it("keeps a subscription's own failure instead of borrowing another login's limits", () => {
+     expect(
+-      resolveThreadDetailsLimits({
++      resolveThreadDetailsUsage({
++        nativeSessionId: "unrouted",
+         providerInstanceId: instanceId,
+         providers: [provider(probeFailed, subscription)],
+         sources: threeAccounts,
+         now,
+-      }),
++      }).limits,
+     ).toEqual({ kind: "notice", notice: "Could not read limits." });
+   });
+ 
+@@ -141,24 +144,129 @@ describe("resolveThreadDetailsLimits", () => {
+     const failedClaude = proxySource([{ id: "cs", limits: probeFailed }]);
+     for (const sources of [[], codexOnly, failedClaude]) {
+       expect(
+-        resolveThreadDetailsLimits({
++        resolveThreadDetailsUsage({
++          nativeSessionId: "unrouted",
+           providerInstanceId: instanceId,
+           providers: [provider(probeFailed, viaProxy)],
+           sources,
+           now,
+-        }),
++        }).limits,
+       ).toEqual({ kind: "notice", notice: "Could not read limits." });
+     }
+   });
+ 
+   it("returns nothing without a selected instance", () => {
+     expect(
+-      resolveThreadDetailsLimits({
++      resolveThreadDetailsUsage({
++        nativeSessionId: "unrouted",
+         providerInstanceId: null,
+         providers: [provider(probeFailed, viaProxy)],
+         sources: threeAccounts,
+         now,
+       }),
+-    ).toBeNull();
++    ).toEqual({ limits: null, route: null });
++  });
++
++  describe("with proxy routing", () => {
++    const routed: UsageLimitSourceSnapshots = threeAccounts.map((source) => ({
++      ...source,
++      routing: {
++        sessions: [
++          {
++            id: "claude:session-1",
++            client: "claude",
++            agent: "main",
++            driver: ProviderDriverKind.make("claudeAgent"),
++            accountId: "ds",
++            model: "claude-opus-5-5",
++            requests: 40,
++            firstSeen: "2026-11-02T21:00:00.000Z",
++            lastSeen: "2026-11-02T21:58:00.000Z",
++            switches: [{ at: "2026-11-02T21:50:00.000Z", from: "cs", to: "ds" }],
++          },
++        ],
++        next: [
++          {
++            driver: ProviderDriverKind.make("claudeAgent"),
++            candidates: [
++              { accountId: "ts", unavailable: true, saturated: true },
++              {
++                accountId: "cs",
++                unavailable: false,
++                saturated: false,
++                adaptive: {
++                  reason: "home",
++                  home: true,
++                  fresh: true,
++                  eligible: true,
++                  draining: false,
++                },
++              },
++            ],
++          },
++        ],
++      },
++    }));
++
++    it("shows the routed account's own limits and its latest switch", () => {
++      const { limits, route } = resolveThreadDetailsUsage({
++        providerInstanceId: instanceId,
++        providers: [provider(probeFailed, viaProxy)],
++        sources: routed,
++        nativeSessionId: "session-1",
++        now,
++      });
++      expect(limits).toEqual({ kind: "own", limits: limits_("ds") });
++      expect(route?.kind).toBe("session");
++      expect(route?.account).toMatchObject({ id: "ds", label: "ds", email: "ds@example.com" });
++      if (route?.kind !== "session") return;
++      expect(route.lastSwitch).toMatchObject({
++        at: Date.parse("2026-11-02T21:50:00.000Z"),
++        from: { id: "cs", label: "cs" },
++      });
++    });
++
++    it("names the account a new chat gets, skipping accounts in cooldown", () => {
++      const { limits, route } = resolveThreadDetailsUsage({
++        providerInstanceId: instanceId,
++        providers: [provider(probeFailed, viaProxy)],
++        sources: routed,
++        nativeSessionId: null,
++        now,
++      });
++      expect(route?.kind).toBe("next");
++      expect(route?.account.id).toBe("cs");
++      expect(limits).toEqual({ kind: "own", limits: limits_("cs") });
++    });
++
++    it("pools the accounts when the proxy no longer knows the chat", () => {
++      const { limits, route } = resolveThreadDetailsUsage({
++        providerInstanceId: instanceId,
++        providers: [provider(probeFailed, viaProxy)],
++        sources: routed,
++        nativeSessionId: "forgotten-after-restart",
++        now,
++      });
++      expect(route).toBeNull();
++      expect(limits?.kind).toBe("pooled");
++    });
++
++    it("ignores routing for an instance on its own subscription", () => {
++      expect(
++        resolveThreadDetailsUsage({
++          providerInstanceId: instanceId,
++          providers: [provider(probeFailed, subscription)],
++          sources: routed,
++          nativeSessionId: "session-1",
++          now,
++        }).route,
++      ).toBeNull();
++    });
+   });
+ });
++
++function limits_(accountId: string): ServerProviderUsageLimits {
++  const account = threeAccounts[0]!.accounts.find((entry) => entry.id === accountId);
++  if (!account) throw new Error(`missing ${accountId}`);
++  return account.usageLimits;
++}
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
+index 7b3c5b1a41..aaf2fafae6 100644
+--- a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
+@@ -13,6 +13,13 @@ import {
+   limitsNotice,
+ } from "@t3tools/shared/usageLimits";
+ 
++import {
++  findProxySession,
++  nextProxyRoute,
++  type ProxyNextRoute,
++  type ProxySessionRoute,
++} from "../../lib/proxyRouting";
++
+ export type ThreadDetailsLimits =
+   | { readonly kind: "own"; readonly limits: ServerProviderUsageLimits }
+   | { readonly kind: "notice"; readonly notice: string }
+@@ -23,19 +30,28 @@ export type ThreadDetailsLimits =
+       readonly sourceLabel: string;
+     };
+ 
++export type ThreadDetailsRoute =
++  | ({ readonly kind: "session" } & ProxySessionRoute)
++  | ({ readonly kind: "next" } & ProxyNextRoute);
++
++export interface ThreadDetailsUsageModel {
++  readonly limits: ThreadDetailsLimits | null;
++  readonly route: ThreadDetailsRoute | null;
++}
++
+ /**
+- * The limits the thread details card shows for one provider instance. An instance that talks to a
+- * custom endpoint (a CLI proxy) cannot read subscription limits itself, so the card falls back to
+- * the pooled limits of the proxy's accounts for the same driver, as the Usage page shows them.
++ * An instance behind a custom endpoint cannot read its own limits, so the card shows the proxy
++ * account serving this chat (or the next chat), else the proxy's pooled accounts for the driver.
+  */
+-export function resolveThreadDetailsLimits(input: {
++export function resolveThreadDetailsUsage(input: {
+   readonly providerInstanceId: ProviderInstanceId | null;
+   readonly providers: readonly ServerProvider[];
+   readonly sources: UsageLimitSourceSnapshots;
++  readonly nativeSessionId: string | null;
+   readonly now: number;
+-}): ThreadDetailsLimits | null {
+-  const { providerInstanceId, providers, sources, now } = input;
+-  if (providerInstanceId === null) return null;
++}): ThreadDetailsUsageModel {
++  const { providerInstanceId, providers, sources, nativeSessionId, now } = input;
++  if (providerInstanceId === null) return { limits: null, route: null };
+   const provider = providers.find((candidate) => candidate.instanceId === providerInstanceId);
+   const report = collectProviderUsageLimits(providerInstanceId, providers, sources, now);
+   // Only this instance's data: other native entries may be a different login or workspace.
+@@ -43,41 +59,59 @@ export function resolveThreadDetailsLimits(input: {
+     report?.accounts.find((entry) => entry.instanceId === providerInstanceId)?.limits ??
+     provider?.usageLimits;
+   const notice = own ? limitsNotice(own) : null;
+-  if (own && notice === null) return { kind: "own", limits: own };
++  if (own && notice === null) return { limits: { kind: "own", limits: own }, route: null };
+ 
+   const routesThroughProxy = provider?.auth.type === "customEndpoint" || own === undefined;
+-  const proxied = routesThroughProxy
+-    ? (report?.accounts ?? []).filter(
+-        (entry) =>
+-          entry.instanceId === undefined &&
+-          entry.sourceLabel !== undefined &&
+-          limitsNotice(entry.limits) === null,
+-      )
+-    : [];
++  const failure: ThreadDetailsLimits | null =
++    own && notice !== null ? { kind: "notice", notice } : null;
++  if (!routesThroughProxy || !provider) return { limits: failure, route: null };
++
++  const session = findProxySession(sources, provider.driver, nativeSessionId);
++  const route: ThreadDetailsRoute | null = session
++    ? { kind: "session", ...session }
++    : nativeSessionId === null
++      ? withKind(nextProxyRoute(sources, provider.driver))
++      : null;
++  const routedLimits = route?.account.account?.usageLimits;
++  if (routedLimits && limitsNotice(routedLimits) === null) {
++    return { limits: { kind: "own", limits: routedLimits }, route };
++  }
++
++  const proxied = (report?.accounts ?? []).filter(
++    (entry) =>
++      entry.instanceId === undefined &&
++      entry.sourceLabel !== undefined &&
++      limitsNotice(entry.limits) === null,
++  );
+   if (proxied.length > 0) {
+-    const accounts = proxied.map(
+-      (entry): LimitAccount => ({
+-        key: entry.id,
+-        driver: entry.driver,
+-        displayName: entry.displayName ?? null,
+-        email: entry.email,
+-        plan: entry.plan,
+-        accentColor: entry.accentColor,
+-        environments: [],
+-        sourceLabel: entry.sourceLabel ?? null,
+-        redeem: null,
+-        limits: entry.limits,
+-      }),
+-    );
++    const accounts = proxied.map((entry): LimitAccount => ({
++      key: entry.id,
++      driver: entry.driver,
++      displayName: entry.displayName ?? null,
++      email: entry.email,
++      plan: entry.plan,
++      accentColor: entry.accentColor,
++      environments: [],
++      sourceLabel: entry.sourceLabel ?? null,
++      redeem: null,
++      limits: entry.limits,
++    }));
+     const pool = collectLimitPools(accounts, now)[0];
+     if (pool && pool.windows.length > 0) {
+       return {
+-        kind: "pooled",
+-        windows: displayLimitWindows(pool),
+-        accountCount: accounts.length,
+-        sourceLabel: proxied[0]!.sourceLabel!,
++        limits: {
++          kind: "pooled",
++          windows: displayLimitWindows(pool),
++          accountCount: accounts.length,
++          sourceLabel: proxied[0]!.sourceLabel!,
++        },
++        route,
+       };
+     }
+   }
+-  return own && notice !== null ? { kind: "notice", notice } : null;
++  return { limits: failure, route };
++}
++
++function withKind(route: ProxyNextRoute | null): ThreadDetailsRoute | null {
++  return route ? { kind: "next", ...route } : null;
+ }
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+index afce18bc4f..cd350046c5 100644
+--- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+@@ -21,7 +21,12 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+ import { ThreadDetailsSection } from "./ThreadDetailsSection";
+-import { resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
++import {
++  describeAdaptiveReason,
++  describeAdaptiveWindow,
++  isRecentSwitch,
++} from "../../lib/proxyRouting";
++import { resolveThreadDetailsUsage, type ThreadDetailsRoute } from "./ThreadDetailsUsage.logic";
+ 
+ const PACE_LABEL: Record<LimitPace, string> = {
+   ahead: "Ahead of pace",
+@@ -33,6 +38,8 @@ export interface ThreadDetailsUsageInput {
+   readonly providerInstanceId: ProviderInstanceId | null;
+   readonly providers: readonly ServerProvider[];
+   readonly sources: UsageLimitSourceSnapshots;
++  /** The provider's own session or thread id, which a CLI proxy routes by. */
++  readonly nativeSessionId: string | null;
+   readonly contextWindow: ContextWindowSnapshot | null;
+ }
+ 
+@@ -43,11 +50,18 @@ export function ThreadDetailsUsage({
+   providerInstanceId,
+   providers,
+   sources,
++  nativeSessionId,
+ }: Omit<ThreadDetailsUsageInput, "contextWindow">) {
+   const nowMinute = useNowMinute();
+   const now = Date.parse(`${nowMinute}:00Z`);
+-  const limits = resolveThreadDetailsLimits({ providerInstanceId, providers, sources, now });
+-  if (!limits) return null;
++  const { limits, route } = resolveThreadDetailsUsage({
++    providerInstanceId,
++    providers,
++    sources,
++    nativeSessionId,
++    now,
++  });
++  if (!limits && !route) return null;
+ 
+   return (
+     <ThreadDetailsSection
+@@ -56,7 +70,8 @@ export function ThreadDetailsUsage({
+       showHeading={false}
+     >
+       <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
+-        {limits.kind === "notice" ? (
++        {route ? <ProxyRouteRow route={route} now={now} /> : null}
++        {!limits ? null : limits.kind === "notice" ? (
+           <UsageRow
+             label="Limits"
+             fill={null}
+@@ -176,6 +191,79 @@ function LimitRow({
+   );
+ }
+ 
++/** Which proxy account serves this chat, or which one a new chat would get. */
++function ProxyRouteRow({
++  route,
++  now,
++}: {
++  readonly route: ThreadDetailsRoute;
++  readonly now: number;
++}) {
++  if (route.kind === "next") {
++    const adaptive = route.candidate.adaptive;
++    const details = [
++      describeAdaptiveWindow("5h", adaptive?.short),
++      describeAdaptiveWindow("Weekly", adaptive?.long),
++    ].filter((line): line is string => line !== null);
++    return (
++      <UsageRow
++        label="Next chat"
++        fill={null}
++        tone={null}
++        value={route.account.label}
++        ariaValue={`goes to ${route.account.email ?? route.account.label}`}
++        tooltip={
++          <>
++            <span className="text-foreground">
++              A new chat goes to {route.account.email ?? route.account.label}
++            </span>
++            {adaptive ? (
++              <span className="text-muted-foreground">
++                {describeAdaptiveReason(adaptive.reason)}
++              </span>
++            ) : null}
++            {details.map((line) => (
++              <span key={line} className="text-muted-foreground">
++                {line}
++              </span>
++            ))}
++            <span className="text-muted-foreground">Chosen by {route.source.label}</span>
++          </>
++        }
++      />
++    );
++  }
++  const recent = isRecentSwitch(route, now);
++  const switched = route.lastSwitch;
++  return (
++    <UsageRow
++      label="Account"
++      fill={null}
++      tone={recent ? "warning" : null}
++      value={route.account.label}
++      ariaValue={`${route.account.email ?? route.account.label}${recent ? ", recently switched" : ""}`}
++      tooltip={
++        <>
++          <span className="text-foreground">
++            {route.account.email ?? route.account.label} via {route.source.label}
++          </span>
++          <span className="text-muted-foreground">
++            {route.session.model} · {route.session.requests} requests
++          </span>
++          {switched ? (
++            <span className={recent ? "text-warning-foreground" : "text-muted-foreground"}>
++              Moved from {switched.from.label} {formatDuration(Math.max(0, now - switched.at))} ago
++              {recent ? "; the prompt cache is rebuilt once" : ""}
++            </span>
++          ) : (
++            <span className="text-muted-foreground">Stayed on this account the whole chat</span>
++          )}
++        </>
++      }
++    />
++  );
++}
++
+ /** A window pooled across a proxy's accounts; it reads like the Usage page's summary. */
+ function PooledLimitRow({
+   window,
+diff --git a/apps/web/src/components/usage/UsageLimitsPooled.tsx b/apps/web/src/components/usage/UsageLimitsPooled.tsx
+index bc69ca4e34..bf85f73ed4 100644
+--- a/apps/web/src/components/usage/UsageLimitsPooled.tsx
++++ b/apps/web/src/components/usage/UsageLimitsPooled.tsx
+@@ -47,6 +47,20 @@ import {
+   resetCreditsSummary,
+   useResetCredit,
+ } from "./UsageLimits";
++import { describeAdaptiveWindow } from "../../lib/proxyRouting";
++import {
++  collectProxyHealthNotices,
++  collectProxyObservability,
++  type ProxyAccountObservability,
++  windowAdaptive,
++  windowHistory,
++} from "./proxyObservability";
++import { UsageSparkline, UsageSparklineMini } from "./UsageSparkline";
++
++/** Routing and history a proxy fork reports, keyed by pooled account key. */
++const ProxyObservabilityContext = createContext<ReadonlyMap<string, ProxyAccountObservability>>(
++  new Map(),
++);
+ 
+ function accountInitials(email: string): string {
+   const [local = "", domain = ""] = email.split("@");
+@@ -196,6 +210,7 @@ function SegmentPopover({
+           <Row label="Restores">+{reset.restoresPercent}% of pool</Row>
+         ) : null}
+       </div>
++      <ProxyAccountDetails account={account} window={window} now={now} />
+       {credits && redeem ? (
+         <div className="border-t border-border/60 pt-2.5 text-muted-foreground">
+           <span className="flex items-center gap-3">
+@@ -216,6 +231,37 @@ function SegmentPopover({
+   );
+ }
+ 
++/** The proxy's view of one account: a week of history, its reserve, and the next-chat pick. */
++function ProxyAccountDetails({
++  account,
++  window,
++  now,
++}: {
++  readonly account: LimitAccount;
++  readonly window: LimitPoolMember["window"];
++  readonly now: number;
++}) {
++  const timestampFormat = usePrimarySettings((settings) => settings.timestampFormat);
++  const observed = use(ProxyObservabilityContext).get(account.key);
++  if (!observed) return null;
++  const history = windowHistory(observed, window);
++  const adaptive = windowAdaptive(observed, window);
++  const spare = describeAdaptiveWindow("Spare", adaptive)?.replace("Spare: ", "");
++  if (history.length < 2 && !spare && !observed.isNext) return null;
++  return (
++    <div className="flex flex-col gap-2 border-t border-border/60 pt-2.5">
++      <UsageSparkline
++        points={history}
++        now={now}
++        reservePercent={adaptive ? adaptive.reserve * 100 : undefined}
++        formatAt={(at) => formatUpcomingTimestamp(new Date(at).toISOString(), timestampFormat, now)}
++      />
++      {spare ? <Row label="Proxy">{spare}</Row> : null}
++      {observed.isNext ? <Row label="Routing">Gets the next new chat</Row> : null}
++    </div>
++  );
++}
++
+ /**
+  * Every segment on the page shares one popover, so hovering or clicking another
+  * segment moves it instead of opening a second one. The payload is the segment
+@@ -448,6 +494,7 @@ function LegendRow({
+ }) {
+   const popover = use(SegmentPopoverContext) ?? undefined;
+   const { account, window } = payload;
++  const observed = use(ProxyObservabilityContext).get(account.key);
+   const remaining = remainingPercent(window);
+   const resetsIn = formatResetsIn(window, now);
+   const credits = account.limits.resetCredits?.availableCount ?? 0;
+@@ -470,6 +517,7 @@ function LegendRow({
+       </span>
+       <AccountName account={account} className="min-w-0 truncate font-medium text-foreground" />
+       <span className="shrink-0 font-semibold text-foreground tabular-nums">{remaining}%</span>
++      <UsageSparklineMini points={windowHistory(observed, window)} now={now} className="ms-2" />
+       <span className="ms-auto flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground tabular-nums">
+         {resetsIn?.replace("resets in ", "↻ ") ?? ""}
+         {credits ? (
+@@ -614,7 +662,11 @@ export function UsageLimitsPooled({
+   const [segmentPopover] = useState(() => PopoverCreateHandle<SegmentPayload>());
+   const segmentPopoverActions = useRef<PopoverPrimitive.Root.Actions | null>(null);
+   const pools = collectLimitPools(collectLimitAccounts(presentations), now);
+-  const notices = collectLimitNotices(presentations);
++  const notices = [
++    ...collectLimitNotices(presentations),
++    ...collectProxyHealthNotices(presentations),
++  ];
++  const proxyObservability = collectProxyObservability(presentations);
+   const externalLinks = collectExternalUsageLinks(presentations);
+   const cursorPromptAt =
+     Math.max(
+@@ -628,27 +680,29 @@ export function UsageLimitsPooled({
+           No provider on the selected environments reports subscription limits.
+         </p>
+       ) : null}
+-      <SegmentPopoverContext value={segmentPopover}>
+-        {pools.map((pool, index) => (
+-          <Fragment key={pool.driver}>
+-            {index === cursorPromptAt ? cursorPrompt : null}
+-            <PoolSection pool={pool} now={now} />
+-          </Fragment>
+-        ))}
+-      </SegmentPopoverContext>
+-      <Popover handle={segmentPopover} actionsRef={segmentPopoverActions}>
+-        {({ payload }) =>
+-          payload ? (
+-            <ActiveSegmentPopover
+-              handle={segmentPopover}
+-              actions={segmentPopoverActions}
+-              payload={payload}
+-              pools={pools}
+-              now={now}
+-            />
+-          ) : null
+-        }
+-      </Popover>
++      <ProxyObservabilityContext value={proxyObservability}>
++        <SegmentPopoverContext value={segmentPopover}>
++          {pools.map((pool, index) => (
++            <Fragment key={pool.driver}>
++              {index === cursorPromptAt ? cursorPrompt : null}
++              <PoolSection pool={pool} now={now} />
++            </Fragment>
++          ))}
++        </SegmentPopoverContext>
++        <Popover handle={segmentPopover} actionsRef={segmentPopoverActions}>
++          {({ payload }) =>
++            payload ? (
++              <ActiveSegmentPopover
++                handle={segmentPopover}
++                actions={segmentPopoverActions}
++                payload={payload}
++                pools={pools}
++                now={now}
++              />
++            ) : null
++          }
++        </Popover>
++      </ProxyObservabilityContext>
+       {cursorPromptAt === pools.length ? cursorPrompt : null}
+       {externalLinks.map((link) => (
+         <section
+diff --git a/apps/web/src/components/usage/UsageSparkline.tsx b/apps/web/src/components/usage/UsageSparkline.tsx
+new file mode 100644
+index 0000000000..d013a41776
+--- /dev/null
++++ b/apps/web/src/components/usage/UsageSparkline.tsx
+@@ -0,0 +1,155 @@
++import { useState } from "react";
++
++import { cn } from "~/lib/utils";
++
++const WEEK_MS = 7 * 24 * 60 * 60_000;
++
++export interface SparklinePoint {
++  readonly at: number;
++  /** Percentage of the window used, 0-100; the line plots what is left. */
++  readonly used: number;
++}
++
++function geometry(
++  points: readonly SparklinePoint[],
++  now: number,
++  width: number,
++  height: number,
++  inset: number,
++) {
++  const start = now - WEEK_MS;
++  const x = (at: number) => inset + ((at - start) / WEEK_MS) * (width - inset * 2);
++  const y = (left: number) => inset + (1 - left / 100) * (height - inset * 2);
++  const visible = points.filter((point) => point.at >= start && point.at <= now);
++  const path = visible
++    .map((point, index) => {
++      const left = Math.max(0, Math.min(100, 100 - point.used));
++      return `${index === 0 ? "M" : "L"}${x(point.at).toFixed(1)},${y(left).toFixed(1)}`;
++    })
++    .join(" ");
++  return { visible, path, x, y };
++}
++
++/** A week of one window's room left, small enough to sit in a legend row. */
++export function UsageSparklineMini({
++  points,
++  now,
++  className,
++}: {
++  readonly points: readonly SparklinePoint[];
++  readonly now: number;
++  readonly className?: string;
++}) {
++  const width = 48;
++  const height = 14;
++  const { visible, path } = geometry(points, now, width, height, 1.5);
++  if (visible.length < 2) return null;
++  return (
++    <svg
++      aria-hidden
++      width={width}
++      height={height}
++      viewBox={`0 0 ${width} ${height}`}
++      className={cn("shrink-0 text-muted-foreground", className)}
++    >
++      <path d={path} fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinejoin="round" />
++    </svg>
++  );
++}
++
++/**
++ * The same week at popover size, with the proxy's reserve as a dashed line: once the room left
++ * falls to it, the proxy stops giving this account new chats. Hovering reads off one hour.
++ */
++export function UsageSparkline({
++  points,
++  now,
++  reservePercent,
++  formatAt,
++}: {
++  readonly points: readonly SparklinePoint[];
++  readonly now: number;
++  readonly reservePercent?: number | undefined;
++  readonly formatAt: (at: number) => string;
++}) {
++  const width = 264;
++  const height = 48;
++  const { visible, path, x, y } = geometry(points, now, width, height, 3);
++  const [hovered, setHovered] = useState<SparklinePoint | null>(null);
++  if (visible.length < 2) return null;
++  const last = visible.at(-1)!;
++  const shown = hovered ?? last;
++  const shownLeft = Math.round(100 - shown.used);
++  return (
++    <div className="flex flex-col gap-1">
++      <span className="flex justify-between text-2xs text-muted-foreground tabular-nums">
++        <span>{hovered ? formatAt(hovered.at) : "Last 7 days"}</span>
++        <span className="font-medium text-foreground">{shownLeft}% left</span>
++      </span>
++      <svg
++        role="img"
++        aria-label={`Room left over the last 7 days, now ${Math.round(100 - last.used)}%`}
++        width={width}
++        height={height}
++        viewBox={`0 0 ${width} ${height}`}
++        className="max-w-full text-foreground/70"
++        onPointerMove={(event) => {
++          const box = event.currentTarget.getBoundingClientRect();
++          const at = now - WEEK_MS + ((event.clientX - box.left) / box.width) * WEEK_MS;
++          let nearest = visible[0]!;
++          for (const point of visible) {
++            if (Math.abs(point.at - at) < Math.abs(nearest.at - at)) nearest = point;
++          }
++          setHovered(nearest);
++        }}
++        onPointerLeave={() => setHovered(null)}
++      >
++        <line
++          x1={3}
++          x2={width - 3}
++          y1={height - 3}
++          y2={height - 3}
++          className="stroke-border"
++          strokeWidth={1}
++        />
++        {reservePercent !== undefined && reservePercent > 0 && reservePercent < 100 ? (
++          <line
++            x1={3}
++            x2={width - 3}
++            y1={y(reservePercent)}
++            y2={y(reservePercent)}
++            className="stroke-muted-foreground/60"
++            strokeWidth={1}
++            strokeDasharray="3 3"
++          />
++        ) : null}
++        <path d={path} fill="none" stroke="currentColor" strokeWidth={2} strokeLinejoin="round" />
++        {hovered ? (
++          <>
++            <line
++              x1={x(hovered.at)}
++              x2={x(hovered.at)}
++              y1={3}
++              y2={height - 3}
++              className="stroke-muted-foreground/50"
++              strokeWidth={1}
++            />
++            <circle
++              cx={x(hovered.at)}
++              cy={y(100 - hovered.used)}
++              r={4}
++              fill="currentColor"
++              className="stroke-popover"
++              strokeWidth={2}
++            />
++          </>
++        ) : null}
++      </svg>
++      {reservePercent !== undefined && reservePercent > 0 ? (
++        <span className="text-2xs text-muted-foreground">
++          Dashed: the proxy's reserve ({Math.round(reservePercent)}%)
++        </span>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/apps/web/src/components/usage/proxyObservability.test.ts b/apps/web/src/components/usage/proxyObservability.test.ts
+new file mode 100644
+index 0000000000..219eb9b890
+--- /dev/null
++++ b/apps/web/src/components/usage/proxyObservability.test.ts
+@@ -0,0 +1,140 @@
++import {
++  EnvironmentId,
++  ProviderDriverKind,
++  type ServerProviderUsageWindow,
++  type UsageLimitSourceSnapshot,
++  UsageLimitSourceId,
++} from "@t3tools/contracts";
++import type { LimitPresentations } from "@t3tools/shared/usageLimits";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  collectProxyHealthNotices,
++  collectProxyObservability,
++  windowAdaptive,
++  windowHistory,
++} from "./proxyObservability";
++
++const claude = ProviderDriverKind.make("claudeAgent");
++const checkedAt = "2026-11-02T22:00:00.000Z";
++
++const source: UsageLimitSourceSnapshot = {
++  id: UsageLimitSourceId.make("hub"),
++  kind: "cliproxy",
++  label: "CLI Proxy",
++  checkedAt,
++  accounts: [
++    {
++      id: "cs.json",
++      driver: claude,
++      email: "cs@example.com",
++      usageLimits: { checkedAt, windows: [] },
++    },
++    {
++      id: "ds.json",
++      driver: claude,
++      email: "ds@example.com",
++      usageLimits: { checkedAt, windows: [] },
++    },
++  ],
++  history: [
++    {
++      accountId: "cs.json",
++      points: [
++        { at: 1_793_600_000, short: 10, long: 20 },
++        { at: 1_793_603_600, long: 22 },
++      ],
++    },
++  ],
++  routing: {
++    sessions: [],
++    next: [
++      {
++        driver: claude,
++        candidates: [
++          { accountId: "ds.json", unavailable: true, saturated: false },
++          {
++            accountId: "cs.json",
++            unavailable: false,
++            saturated: false,
++            adaptive: {
++              reason: "home",
++              home: true,
++              fresh: true,
++              eligible: true,
++              draining: false,
++              long: {
++                used: 0.22,
++                reserve: 0.5,
++                spare: 0.28,
++                forecast: 0.4,
++                learning: false,
++                inactive: false,
++              },
++            },
++          },
++        ],
++      },
++    ],
++  },
++  health: {
++    updateAvailable: "proxy v8.0.52",
++    failedRuns: [
++      { at: checkedAt, component: "panel", step: "preflight", detail: "working tree is dirty" },
++    ],
++    stoppedServices: ["local.cliproxyapi-alloy"],
++  },
++};
++
++function presentations(sources: readonly UsageLimitSourceSnapshot[]): LimitPresentations {
++  return new Map([
++    [
++      EnvironmentId.make("local"),
++      {
++        entry: { target: { label: "Mac" } },
++        serverConfig: { providers: [], usageLimitSources: sources },
++      },
++    ],
++  ]);
++}
++
++const weekly: ServerProviderUsageWindow = {
++  id: "seven_day",
++  kind: "weekly",
++  label: "Weekly",
++  usedPercent: 22,
++};
++
++describe("collectProxyObservability", () => {
++  it("joins history and the next-chat queue to pooled account keys", () => {
++    const observed = collectProxyObservability(presentations([source]));
++    const cs = observed.get("hub:cs.json");
++    expect(cs?.isNext).toBe(true);
++    expect(observed.get("hub:ds.json")?.isNext).toBe(false);
++    expect(windowHistory(cs, weekly)).toEqual([
++      { at: 1_793_600_000_000, used: 20 },
++      { at: 1_793_603_600_000, used: 22 },
++    ]);
++    expect(windowHistory(cs, { ...weekly, id: "five_hour", kind: "session" })).toEqual([
++      { at: 1_793_600_000_000, used: 10 },
++    ]);
++    // Model-scoped weeklies are not sampled, so they draw no line.
++    expect(windowHistory(cs, { ...weekly, id: "seven_day_fable" })).toEqual([]);
++    expect(windowAdaptive(cs, weekly)?.reserve).toBe(0.5);
++  });
++
++  it("is empty for a stock proxy", () => {
++    const { history: _h, routing: _r, health: _he, ...stock } = source;
++    expect(collectProxyObservability(presentations([stock])).size).toBe(0);
++    expect(collectProxyHealthNotices(presentations([stock]))).toEqual([]);
++  });
++});
++
++describe("collectProxyHealthNotices", () => {
++  it("names failed updaters with pending updates and stopped jobs", () => {
++    expect(collectProxyHealthNotices(presentations([source]))).toEqual([
++      "CLI Proxy: the panel updater failed at preflight: working tree is dirty. Pending: proxy v8.0.52.",
++      "CLI Proxy: local.cliproxyapi-alloy is not running.",
++    ]);
++  });
++});
+diff --git a/apps/web/src/components/usage/proxyObservability.ts b/apps/web/src/components/usage/proxyObservability.ts
+new file mode 100644
+index 0000000000..933eed342f
+--- /dev/null
++++ b/apps/web/src/components/usage/proxyObservability.ts
+@@ -0,0 +1,103 @@
++import type {
++  ServerProviderUsageWindow,
++  UsageLimitSourceAdaptiveWindow,
++  UsageLimitSourceHistory,
++  UsageLimitSourceRoutingCandidate,
++} from "@t3tools/contracts";
++import type { LimitPresentations } from "@t3tools/shared/usageLimits";
++
++type HistoryPoints = UsageLimitSourceHistory[number]["points"];
++
++export interface ProxyAccountObservability {
++  readonly history: HistoryPoints;
++  readonly candidate: UsageLimitSourceRoutingCandidate | undefined;
++  /** The proxy would give this account the next new chat. */
++  readonly isNext: boolean;
++}
++
++/** Keyed like the pooled Usage page's accounts: `<source id>:<account id>`. */
++export function collectProxyObservability(
++  presentations: LimitPresentations,
++): ReadonlyMap<string, ProxyAccountObservability> {
++  const result = new Map<string, ProxyAccountObservability>();
++  for (const presentation of presentations.values()) {
++    for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
++      const history = new Map(source.history?.map((entry) => [entry.accountId, entry.points]));
++      const candidates = new Map<string, UsageLimitSourceRoutingCandidate>();
++      const next = new Set<string>();
++      for (const queue of source.routing?.next ?? []) {
++        const chosen = queue.candidates.find((candidate) => !candidate.unavailable);
++        if (chosen) next.add(chosen.accountId);
++        for (const candidate of queue.candidates) candidates.set(candidate.accountId, candidate);
++      }
++      for (const account of source.accounts) {
++        const points = history.get(account.id);
++        const candidate = candidates.get(account.id);
++        if (!points && !candidate) continue;
++        const observed = {
++          history: points ?? [],
++          candidate,
++          isNext: next.has(account.id),
++        };
++        result.set(`${source.id}:${account.id}`, observed);
++        if (account.workspaceId) {
++          result.set(`${source.id}:${account.id}:${account.workspaceId}`, observed);
++        }
++      }
++    }
++  }
++  return result;
++}
++
++/** The proxy samples its account-wide 5h and weekly windows; model-scoped rows have no history. */
++function historyField(window: ServerProviderUsageWindow): "short" | "long" | null {
++  if (window.kind === "session") return "short";
++  if (window.kind !== "weekly") return null;
++  return window.id === "seven_day" || window.id === "secondary" ? "long" : null;
++}
++
++export function windowHistory(
++  observed: ProxyAccountObservability | undefined,
++  window: ServerProviderUsageWindow,
++): ReadonlyArray<{ readonly at: number; readonly used: number }> {
++  const field = observed ? historyField(window) : null;
++  if (!observed || !field) return [];
++  return observed.history.flatMap((point) => {
++    const used = point[field];
++    return used === undefined ? [] : [{ at: point.at * 1000, used }];
++  });
++}
++
++export function windowAdaptive(
++  observed: ProxyAccountObservability | undefined,
++  window: ServerProviderUsageWindow,
++): UsageLimitSourceAdaptiveWindow | undefined {
++  const field = historyField(window);
++  if (!field) return undefined;
++  return observed?.candidate?.adaptive?.[field];
++}
++
++/** What a proxy fork reports as needing attention, phrased for the Usage page notices. */
++export function collectProxyHealthNotices(presentations: LimitPresentations): readonly string[] {
++  const notices: string[] = [];
++  const labelEnvironment = presentations.size > 1;
++  for (const presentation of presentations.values()) {
++    for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
++      const health = source.health;
++      if (!health) continue;
++      const label = labelEnvironment
++        ? `${presentation.entry.target.label} · ${source.label}`
++        : source.label;
++      for (const run of health.failedRuns) {
++        const step = run.step ? ` at ${run.step}` : "";
++        const detail = run.detail ? `: ${run.detail.replace(/[.\s]+$/, "")}.` : ".";
++        const pending = health.updateAvailable ? ` Pending: ${health.updateAvailable}.` : "";
++        notices.push(`${label}: the ${run.component} updater failed${step}${detail}${pending}`);
++      }
++      for (const service of health.stoppedServices) {
++        notices.push(`${label}: ${service} is not running.`);
++      }
++    }
++  }
++  return notices;
++}
+diff --git a/apps/web/src/lib/proxyRouting.ts b/apps/web/src/lib/proxyRouting.ts
+new file mode 100644
+index 0000000000..230ea8e93e
+--- /dev/null
++++ b/apps/web/src/lib/proxyRouting.ts
+@@ -0,0 +1,113 @@
++import type {
++  ProviderDriverKind,
++  UsageLimitSourceAccount,
++  UsageLimitSourceAdaptiveWindow,
++  UsageLimitSourceRoutingCandidate,
++  UsageLimitSourceRoutingSession,
++  UsageLimitSourceSnapshot,
++  UsageLimitSourceSnapshots,
++} from "@t3tools/contracts";
++
++/** A switch this recent still costs the chat its prompt cache on the next turn or so. */
++export const RECENT_SWITCH_MS = 30 * 60_000;
++
++export interface ProxyAccountRef {
++  readonly id: string;
++  readonly label: string;
++  readonly email: string | undefined;
++  readonly account: UsageLimitSourceAccount | undefined;
++}
++
++export interface ProxySessionRoute {
++  readonly source: UsageLimitSourceSnapshot;
++  readonly session: UsageLimitSourceRoutingSession;
++  readonly account: ProxyAccountRef;
++  readonly lastSwitch: { readonly at: number; readonly from: ProxyAccountRef } | null;
++}
++
++export interface ProxyNextRoute {
++  readonly source: UsageLimitSourceSnapshot;
++  readonly candidate: UsageLimitSourceRoutingCandidate;
++  readonly account: ProxyAccountRef;
++}
++
++/** The proxy keys chats by client and the native session or thread id T3 already stores. */
++export function proxySessionId(driver: ProviderDriverKind, nativeSessionId: string): string {
++  return `${driver === "codex" ? "codex" : "claude"}:${nativeSessionId}`;
++}
++
++export function proxyAccountRef(source: UsageLimitSourceSnapshot, id: string): ProxyAccountRef {
++  const account = source.accounts.find((candidate) => candidate.id === id);
++  const email = account?.email ?? (id.includes("@") ? id.replace(/\.json$/, "") : undefined);
++  const label = email?.split("@")[0] || id.replace(/\.json$/, "");
++  return { id, label, email, account };
++}
++
++export function findProxySession(
++  sources: UsageLimitSourceSnapshots,
++  driver: ProviderDriverKind,
++  nativeSessionId: string | null,
++): ProxySessionRoute | null {
++  if (!nativeSessionId) return null;
++  const id = proxySessionId(driver, nativeSessionId);
++  for (const source of sources) {
++    const session = source.routing?.sessions.find((candidate) => candidate.id === id);
++    if (!session) continue;
++    const switched = session.switches.at(-1);
++    return {
++      source,
++      session,
++      account: proxyAccountRef(source, session.accountId),
++      lastSwitch: switched
++        ? { at: Date.parse(switched.at), from: proxyAccountRef(source, switched.from) }
++        : null,
++    };
++  }
++  return null;
++}
++
++/** The account the proxy would give a new chat now: the first in its queue not cooling down. */
++export function nextProxyRoute(
++  sources: UsageLimitSourceSnapshots,
++  driver: ProviderDriverKind,
++): ProxyNextRoute | null {
++  for (const source of sources) {
++    const queue = source.routing?.next.find((entry) => entry.driver === driver);
++    const candidate = queue?.candidates.find((entry) => !entry.unavailable);
++    if (queue && candidate) {
++      return { source, candidate, account: proxyAccountRef(source, candidate.accountId) };
++    }
++  }
++  return null;
++}
++
++export function isRecentSwitch(route: ProxySessionRoute, now: number): boolean {
++  return route.lastSwitch !== null && now - route.lastSwitch.at < RECENT_SWITCH_MS;
++}
++
++const REASON_LABELS: Record<string, string> = {
++  home: "Home account, with spare capacity",
++  surplus_selected: "Borrowing spare capacity from another account",
++  surplus: "Has spare capacity",
++  fallback: "Last resort: no account has safe spare capacity",
++  reserved: "Its spare capacity is held back for forecast demand",
++  stale: "Usage data is too old to count on",
++  exhausted: "Out of quota",
++  cooldown: "Cooling down after a rate limit",
++};
++
++export function describeAdaptiveReason(reason: string): string {
++  return REASON_LABELS[reason] ?? (reason ? reason.replaceAll("-", " ") : "Next in the queue");
++}
++
++const share = (value: number) => `${Math.round(Math.max(0, value) * 100)}%`;
++
++/** "62% spare after a 30% reserve", the way the proxy weighs a window for new chats. */
++export function describeAdaptiveWindow(
++  label: string,
++  window: UsageLimitSourceAdaptiveWindow | undefined,
++): string | null {
++  if (!window || window.inactive) return null;
++  const learning = window.learning ? " (still learning usage)" : "";
++  return `${label}: ${share(window.spare)} spare after a ${share(window.reserve)} reserve, ${share(window.used)} used${learning}`;
++}
+diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
+index b73e208c94..09cbe6dd1d 100644
+--- a/packages/contracts/src/providerUsageLimits.ts
++++ b/packages/contracts/src/providerUsageLimits.ts
+@@ -75,6 +75,98 @@ export const UsageLimitSourceAccount = Schema.Struct({
+ });
+ export type UsageLimitSourceAccount = typeof UsageLimitSourceAccount.Type;
+ 
++/** One chat the proxy routes, keyed `<client>:<native session id>`; accounts use auth-file ids. */
++export const UsageLimitSourceRoutingSession = Schema.Struct({
++  id: TrimmedNonEmptyString,
++  client: Schema.optional(Schema.String),
++  agent: Schema.optional(Schema.String),
++  parent: Schema.optional(Schema.String),
++  driver: ProviderDriverKind,
++  accountId: TrimmedNonEmptyString,
++  model: Schema.String,
++  requests: NonNegativeInt,
++  firstSeen: IsoDateTime,
++  lastSeen: IsoDateTime,
++  switches: Schema.Array(
++    Schema.Struct({ at: IsoDateTime, from: Schema.String, to: Schema.String }),
++  ),
++});
++export type UsageLimitSourceRoutingSession = typeof UsageLimitSourceRoutingSession.Type;
++
++/** Shares are 0-1 of the window: what is used, held back for forecast demand, and spare. */
++export const UsageLimitSourceAdaptiveWindow = Schema.Struct({
++  used: Schema.Number,
++  reset: Schema.optional(IsoDateTime),
++  reserve: Schema.Number,
++  spare: Schema.Number,
++  forecast: Schema.Number,
++  learning: Schema.Boolean,
++  inactive: Schema.Boolean,
++});
++export type UsageLimitSourceAdaptiveWindow = typeof UsageLimitSourceAdaptiveWindow.Type;
++
++/** An account in the queue for the proxy's next new chat, best first. */
++export const UsageLimitSourceRoutingCandidate = Schema.Struct({
++  accountId: TrimmedNonEmptyString,
++  unavailable: Schema.Boolean,
++  saturated: Schema.Boolean,
++  retryAfter: Schema.optional(IsoDateTime),
++  adaptive: Schema.optional(
++    Schema.Struct({
++      reason: Schema.String,
++      home: Schema.Boolean,
++      fresh: Schema.Boolean,
++      eligible: Schema.Boolean,
++      draining: Schema.Boolean,
++      short: Schema.optional(UsageLimitSourceAdaptiveWindow),
++      long: Schema.optional(UsageLimitSourceAdaptiveWindow),
++    }),
++  ),
++});
++export type UsageLimitSourceRoutingCandidate = typeof UsageLimitSourceRoutingCandidate.Type;
++
++export const UsageLimitSourceRouting = Schema.Struct({
++  sessions: Schema.Array(UsageLimitSourceRoutingSession),
++  next: Schema.Array(
++    Schema.Struct({
++      driver: ProviderDriverKind,
++      candidates: Schema.Array(UsageLimitSourceRoutingCandidate),
++    }),
++  ),
++});
++export type UsageLimitSourceRouting = typeof UsageLimitSourceRouting.Type;
++
++/** Hourly usage per account, as 0-100 percentages; `at` is epoch seconds. */
++export const UsageLimitSourceHistory = Schema.Array(
++  Schema.Struct({
++    accountId: TrimmedNonEmptyString,
++    points: Schema.Array(
++      Schema.Struct({
++        at: NonNegativeInt,
++        short: Schema.optional(Schema.Number),
++        long: Schema.optional(Schema.Number),
++      }),
++    ),
++  }),
++);
++export type UsageLimitSourceHistory = typeof UsageLimitSourceHistory.Type;
++
++/** Problems a proxy fork reports about itself: failed updates, stopped services, lag. */
++export const UsageLimitSourceHealth = Schema.Struct({
++  version: Schema.optional(Schema.String),
++  updateAvailable: Schema.optional(Schema.String),
++  failedRuns: Schema.Array(
++    Schema.Struct({
++      at: IsoDateTime,
++      component: Schema.String,
++      step: Schema.optional(Schema.String),
++      detail: Schema.optional(Schema.String),
++    }),
++  ),
++  stoppedServices: Schema.Array(Schema.String),
++});
++export type UsageLimitSourceHealth = typeof UsageLimitSourceHealth.Type;
++
+ export const UsageLimitSourceSnapshot = Schema.Struct({
+   id: UsageLimitSourceId,
+   kind: Schema.Literal("cliproxy"),
+@@ -82,6 +174,10 @@ export const UsageLimitSourceSnapshot = Schema.Struct({
+   checkedAt: IsoDateTime,
+   accounts: ForwardCompatibleArray(UsageLimitSourceAccount),
+   error: Schema.optional(TrimmedNonEmptyString),
++  /** Only proxies that serve the fork's observability endpoints report these. */
++  routing: Schema.optional(UsageLimitSourceRouting),
++  history: Schema.optional(UsageLimitSourceHistory),
++  health: Schema.optional(UsageLimitSourceHealth),
+ });
+ export type UsageLimitSourceSnapshot = typeof UsageLimitSourceSnapshot.Type;
+ 
