@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:37:37 +0100
-Subject: [PATCH 9/9] Local: show CLI proxy routing, history and health
+Subject: [PATCH 09/11] Local: show CLI proxy routing, history and health
 
 A CLIProxyAPI fork serves routing, quota-history and fork-status endpoints beside
 the stock management API. The server now reads them with each source refresh
@@ -21,7 +21,7 @@ answer 404 and are unaffected.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- apps/server/src/usage/UsageLimitSources.ts    |  68 ++++-
+ apps/server/src/usage/UsageLimitSources.ts    |  67 ++++-
  apps/server/src/usage/cliproxyApi.ts          |  26 +-
  .../src/usage/cliproxyObservability.test.ts   | 209 +++++++++++++++
  .../server/src/usage/cliproxyObservability.ts | 241 ++++++++++++++++++
@@ -36,7 +36,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../components/usage/proxyObservability.ts    | 103 ++++++++
  apps/web/src/lib/proxyRouting.ts              | 113 ++++++++
  packages/contracts/src/providerUsageLimits.ts |  96 +++++++
- 15 files changed, 1550 insertions(+), 78 deletions(-)
+ 15 files changed, 1547 insertions(+), 80 deletions(-)
  create mode 100644 apps/server/src/usage/cliproxyObservability.test.ts
  create mode 100644 apps/server/src/usage/cliproxyObservability.ts
  create mode 100644 apps/web/src/components/chat/ProxySwitchBanner.tsx
@@ -46,11 +46,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 apps/web/src/lib/proxyRouting.ts
 
 diff --git a/apps/server/src/usage/UsageLimitSources.ts b/apps/server/src/usage/UsageLimitSources.ts
-index 7a068cde85..026f2fe0dc 100644
+index 7d40b0fb9ec..3a2bd80a452 100644
 --- a/apps/server/src/usage/UsageLimitSources.ts
 +++ b/apps/server/src/usage/UsageLimitSources.ts
-@@ -46,12 +46,34 @@ function sourceLabel(id: string, config: UsageLimitSourceConfig): string {
-   }
+@@ -56,6 +56,26 @@ function missingManagementKey(config: UsageLimitSourceConfig): string {
+     : "Could not read the management key from its secret provider.";
  }
  
 +const OBSERVABILITY_INTERVAL = Duration.seconds(60);
@@ -76,21 +76,25 @@ index 7a068cde85..026f2fe0dc 100644
  /** @public */
  export const make = Effect.gen(function* () {
    const api = yield* makeCliproxyApi;
-   const settingsService = yield* Settings.ServerSettingsService;
-   const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
+@@ -69,6 +89,8 @@ export const make = Effect.gen(function* () {
+     return settingsSecretLiteral(resolved.managementKey);
+   });
    const stateRef = yield* Ref.make<ReadonlyArray<UsageLimitSourceSnapshot>>([]);
 +  // Sources whose proxy serves no observability endpoints; cleared by each full refresh.
 +  const withoutObservability = new Set<UsageLimitSourceId>();
    const changes = yield* Effect.acquireRelease(
      PubSub.unbounded<ReadonlyArray<UsageLimitSourceSnapshot>>(),
      PubSub.shutdown,
-@@ -66,12 +88,17 @@ export const make = Effect.gen(function* () {
-     if (config.managementKey.length === 0) {
-       return { ...base, accounts: [], error: "No management key configured." };
+@@ -84,14 +106,18 @@ export const make = Effect.gen(function* () {
+     if (managementKey.length === 0) {
+       return { ...base, accounts: [], error: missingManagementKey(config) };
      }
--    const accounts = yield* api.readAccounts(config).pipe(Effect.result);
+-    const accounts = yield* api
+-      .readAccounts({ url: config.url, managementKey })
+-      .pipe(Effect.result);
++    const hub = { url: config.url, managementKey };
 +    const [accounts, observed] = yield* Effect.all(
-+      [api.readAccounts(config).pipe(Effect.result), api.readObservability(config)],
++      [api.readAccounts(hub).pipe(Effect.result), api.readObservability(hub)],
 +      { concurrency: 2 },
 +    );
 +    if (observes(observed)) withoutObservability.delete(id);
@@ -105,7 +109,7 @@ index 7a068cde85..026f2fe0dc 100644
    });
  
    const publish = Effect.fn("UsageLimitSources.publish")(function* (
-@@ -100,6 +127,33 @@ export const make = Effect.gen(function* () {
+@@ -120,6 +146,29 @@ export const make = Effect.gen(function* () {
      yield* publish(snapshots);
    }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
  
@@ -118,19 +122,15 @@ index 7a068cde85..026f2fe0dc 100644
 +    const current = yield* Ref.get(stateRef);
 +    const next = yield* Effect.forEach(
 +      current,
-+      (snapshot) => {
-+        const config = sources[snapshot.id];
-+        if (!config?.enabled || !config.managementKey || withoutObservability.has(snapshot.id)) {
-+          return Effect.succeed(snapshot);
-+        }
-+        return api
-+          .readObservability(config)
-+          .pipe(
-+            Effect.map((observed) =>
-+              observes(observed) ? withObservability(snapshot, observed) : snapshot,
-+            ),
-+          );
-+      },
++      (snapshot) =>
++        Effect.gen(function* () {
++          const config = sources[snapshot.id];
++          if (!config?.enabled || withoutObservability.has(snapshot.id)) return snapshot;
++          const managementKey = yield* readManagementKey(config);
++          if (managementKey.length === 0) return snapshot;
++          const observed = yield* api.readObservability({ url: config.url, managementKey });
++          return observes(observed) ? withObservability(snapshot, observed) : snapshot;
++        }),
 +      { concurrency: 4 },
 +    );
 +    yield* publish(next);
@@ -139,7 +139,7 @@ index 7a068cde85..026f2fe0dc 100644
    // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
    const consumeResetCredit = Effect.fn("UsageLimitSources.consumeResetCredit")(function* (
      input: UsageLimitSourceConsumeResetCreditInput,
-@@ -147,6 +201,14 @@ export const make = Effect.gen(function* () {
+@@ -175,6 +224,14 @@ export const make = Effect.gen(function* () {
      ),
    ).pipe(Effect.forkScoped);
  
@@ -155,7 +155,7 @@ index 7a068cde85..026f2fe0dc 100644
  
    return {
 diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
-index 29bdfe118c..2aa30d21e8 100644
+index 1b36e819e29..2110774e6a3 100644
 --- a/apps/server/src/usage/cliproxyApi.ts
 +++ b/apps/server/src/usage/cliproxyApi.ts
 @@ -17,6 +17,7 @@ import { codexPlanLabel } from "../provider/CodexProvider.ts";
@@ -164,33 +164,35 @@ index 29bdfe118c..2aa30d21e8 100644
  import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
 +import { toHealth, toHistory, toRouting } from "./cliproxyObservability.ts";
  
- const AuthFile = Schema.Struct({
-   id: Schema.String,
-@@ -176,11 +177,12 @@ export const makeCliproxyApi = Effect.gen(function* () {
-     config: UsageLimitSourceConfig,
+ /** A hub with its management key already read from wherever the setting keeps it. */
+ export interface CliproxyHub {
+@@ -182,13 +183,14 @@ export const makeCliproxyApi = Effect.gen(function* () {
+     hub: CliproxyHub,
      path: string,
      body?: unknown,
 +    apiVersion: "v0" | "v8" = "v0",
    ) {
      const url = yield* Effect.try({
-       try: () =>
-         new URL(
--          `v0/management/${path}`,
-+          `${apiVersion}/management/${path}`,
-           config.url.endsWith("/") ? config.url : `${config.url}/`,
-         ).toString(),
+       try: () => {
+         const base = new URL(hub.url);
+         // Users often paste the hub's web panel URL, which ends in management.html.
+         base.pathname = base.pathname.replace(/(\/management\.html)?\/?$/i, "/");
+-        return new URL(`v0/management/${path}`, base).toString();
++        return new URL(`${apiVersion}/management/${path}`, base).toString();
+       },
        catch: () => new UsageLimitSourceError({ detail: "The hub URL is not valid." }),
-@@ -438,5 +440,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
+     });
+@@ -445,5 +447,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
        ),
      );
    });
 -  return { readAccounts, consume };
 +  /** The fork's observability data; each part is undefined when the proxy does not serve it. */
 +  const readObservability = Effect.fn("CliproxyApi.readObservability")(function* (
-+    config: UsageLimitSourceConfig,
++    hub: CliproxyHub,
 +  ) {
 +    const read = (path: string) =>
-+      management(config, `observability/${path}`, undefined, "v8").pipe(
++      management(hub, `observability/${path}`, undefined, "v8").pipe(
 +        Effect.orElseSucceed(() => undefined),
 +      );
 +    const [routing, history, fork] = yield* Effect.all(
@@ -209,7 +211,7 @@ index 29bdfe118c..2aa30d21e8 100644
  });
 diff --git a/apps/server/src/usage/cliproxyObservability.test.ts b/apps/server/src/usage/cliproxyObservability.test.ts
 new file mode 100644
-index 0000000000..ae9b8d6416
+index 00000000000..ae9b8d6416e
 --- /dev/null
 +++ b/apps/server/src/usage/cliproxyObservability.test.ts
 @@ -0,0 +1,209 @@
@@ -424,7 +426,7 @@ index 0000000000..ae9b8d6416
 +});
 diff --git a/apps/server/src/usage/cliproxyObservability.ts b/apps/server/src/usage/cliproxyObservability.ts
 new file mode 100644
-index 0000000000..b98a2b1cb2
+index 00000000000..b98a2b1cb2c
 --- /dev/null
 +++ b/apps/server/src/usage/cliproxyObservability.ts
 @@ -0,0 +1,241 @@
@@ -670,10 +672,10 @@ index 0000000000..b98a2b1cb2
 +  };
 +}
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index b1448ca05b..92705b525d 100644
+index 11684c52d2e..8405a0d4ef7 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -313,6 +313,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
+@@ -318,6 +318,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
  import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
  import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
@@ -681,7 +683,7 @@ index b1448ca05b..92705b525d 100644
  import { ComposerStats } from "./chat/ComposerStats";
  import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
  import { ComposerSurface } from "./chat/ComposerSurface";
-@@ -2615,6 +2616,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2633,6 +2634,11 @@ export default function ChatView(props: ChatViewProps) {
            },
          })
        : null;
@@ -693,19 +695,19 @@ index b1448ca05b..92705b525d 100644
    const composerBannerItems = (() => {
      const fallbackSelection = draftFallback?.selection;
      const defaultSelection =
-@@ -2662,7 +2668,10 @@ export default function ChatView(props: ChatViewProps) {
-           ]
-         : [];
-     const limitRecoveryItems = limitRecoveryBanner === null ? [] : [limitRecoveryBanner];
+@@ -2684,7 +2690,10 @@ export default function ChatView(props: ChatViewProps) {
+       deriveProviderExtensionStatuses(serverProjection),
+     );
+     const extensionStatusItems = extensionStatusBanner === null ? [] : [extensionStatusBanner];
 -    const usageLimitsItems = usageLimitsBanner === null ? [] : [usageLimitsBanner];
 +    const usageLimitsItems = [
 +      ...(usageLimitsBanner === null ? [] : [usageLimitsBanner]),
 +      ...(proxySwitchBanner === null ? [] : [proxySwitchBanner]),
 +    ];
      const projectCloneItems = projectCloneBannerItem === null ? [] : [projectCloneBannerItem];
-     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
-       return [
-@@ -3992,6 +4001,7 @@ export default function ChatView(props: ChatViewProps) {
+     // An approval's feedback goes to that approval; the armed session waits for the next message.
+     const freshSessionItems =
+@@ -4039,6 +4048,7 @@ export default function ChatView(props: ChatViewProps) {
                      providerInstanceId: activeProviderInstanceId,
                      providers: providerStatuses,
                      sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
@@ -715,7 +717,7 @@ index b1448ca05b..92705b525d 100644
                  />
 diff --git a/apps/web/src/components/chat/ProxySwitchBanner.tsx b/apps/web/src/components/chat/ProxySwitchBanner.tsx
 new file mode 100644
-index 0000000000..660b6e676e
+index 00000000000..660b6e676e2
 --- /dev/null
 +++ b/apps/web/src/components/chat/ProxySwitchBanner.tsx
 @@ -0,0 +1,37 @@
@@ -757,7 +759,7 @@ index 0000000000..660b6e676e
 +  };
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
-index b14b2c8cb6..75411523b3 100644
+index b14b2c8cb67..75411523b30 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 @@ -8,7 +8,7 @@ import {
@@ -948,7 +950,7 @@ index b14b2c8cb6..75411523b3 100644
 +  return account.usageLimits;
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
-index 7b3c5b1a41..aaf2fafae6 100644
+index 7b3c5b1a417..aaf2fafae64 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 @@ -13,6 +13,13 @@ import {
@@ -1090,10 +1092,10 @@ index 7b3c5b1a41..aaf2fafae6 100644
 +  return route ? { kind: "next", ...route } : null;
  }
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index afce18bc4f..cd350046c5 100644
+index 4e40bb81931..fec7dee3d29 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-@@ -21,7 +21,12 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
+@@ -22,7 +22,12 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
  import { ThreadDetailsSection } from "./ThreadDetailsSection";
@@ -1107,7 +1109,7 @@ index afce18bc4f..cd350046c5 100644
  
  const PACE_LABEL: Record<LimitPace, string> = {
    ahead: "Ahead of pace",
-@@ -33,6 +38,8 @@ export interface ThreadDetailsUsageInput {
+@@ -34,6 +39,8 @@ export interface ThreadDetailsUsageInput {
    readonly providerInstanceId: ProviderInstanceId | null;
    readonly providers: readonly ServerProvider[];
    readonly sources: UsageLimitSourceSnapshots;
@@ -1116,7 +1118,7 @@ index afce18bc4f..cd350046c5 100644
    readonly contextWindow: ContextWindowSnapshot | null;
  }
  
-@@ -43,11 +50,18 @@ export function ThreadDetailsUsage({
+@@ -44,11 +51,18 @@ export function ThreadDetailsUsage({
    providerInstanceId,
    providers,
    sources,
@@ -1137,7 +1139,7 @@ index afce18bc4f..cd350046c5 100644
  
    return (
      <ThreadDetailsSection
-@@ -56,7 +70,8 @@ export function ThreadDetailsUsage({
+@@ -57,7 +71,8 @@ export function ThreadDetailsUsage({
        showHeading={false}
      >
        <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
@@ -1147,7 +1149,7 @@ index afce18bc4f..cd350046c5 100644
            <UsageRow
              label="Limits"
              fill={null}
-@@ -176,6 +191,79 @@ function LimitRow({
+@@ -177,6 +192,79 @@ function LimitRow({
    );
  }
  
@@ -1228,7 +1230,7 @@ index afce18bc4f..cd350046c5 100644
  function PooledLimitRow({
    window,
 diff --git a/apps/web/src/components/usage/UsageLimitsPooled.tsx b/apps/web/src/components/usage/UsageLimitsPooled.tsx
-index bc69ca4e34..bf85f73ed4 100644
+index bc69ca4e340..bf85f73ed43 100644
 --- a/apps/web/src/components/usage/UsageLimitsPooled.tsx
 +++ b/apps/web/src/components/usage/UsageLimitsPooled.tsx
 @@ -47,6 +47,20 @@ import {
@@ -1380,7 +1382,7 @@ index bc69ca4e34..bf85f73ed4 100644
          <section
 diff --git a/apps/web/src/components/usage/UsageSparkline.tsx b/apps/web/src/components/usage/UsageSparkline.tsx
 new file mode 100644
-index 0000000000..d013a41776
+index 00000000000..d013a41776d
 --- /dev/null
 +++ b/apps/web/src/components/usage/UsageSparkline.tsx
 @@ -0,0 +1,155 @@
@@ -1541,7 +1543,7 @@ index 0000000000..d013a41776
 +}
 diff --git a/apps/web/src/components/usage/proxyObservability.test.ts b/apps/web/src/components/usage/proxyObservability.test.ts
 new file mode 100644
-index 0000000000..219eb9b890
+index 00000000000..219eb9b8901
 --- /dev/null
 +++ b/apps/web/src/components/usage/proxyObservability.test.ts
 @@ -0,0 +1,140 @@
@@ -1687,7 +1689,7 @@ index 0000000000..219eb9b890
 +});
 diff --git a/apps/web/src/components/usage/proxyObservability.ts b/apps/web/src/components/usage/proxyObservability.ts
 new file mode 100644
-index 0000000000..933eed342f
+index 00000000000..933eed342f9
 --- /dev/null
 +++ b/apps/web/src/components/usage/proxyObservability.ts
 @@ -0,0 +1,103 @@
@@ -1796,7 +1798,7 @@ index 0000000000..933eed342f
 +}
 diff --git a/apps/web/src/lib/proxyRouting.ts b/apps/web/src/lib/proxyRouting.ts
 new file mode 100644
-index 0000000000..230ea8e93e
+index 00000000000..230ea8e93ee
 --- /dev/null
 +++ b/apps/web/src/lib/proxyRouting.ts
 @@ -0,0 +1,113 @@
@@ -1914,7 +1916,7 @@ index 0000000000..230ea8e93e
 +  return `${label}: ${share(window.spare)} spare after a ${share(window.reserve)} reserve, ${share(window.used)} used${learning}`;
 +}
 diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
-index b73e208c94..09cbe6dd1d 100644
+index b73e208c949..09cbe6dd1d3 100644
 --- a/packages/contracts/src/providerUsageLimits.ts
 +++ b/packages/contracts/src/providerUsageLimits.ts
 @@ -75,6 +75,98 @@ export const UsageLimitSourceAccount = Schema.Struct({

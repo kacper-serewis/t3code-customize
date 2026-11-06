@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:22:06 +0100
-Subject: [PATCH 8/9] Local: show a proxy's pooled limits in the thread details
- card
+Subject: [PATCH 08/11] Local: show a proxy's pooled limits in the thread
+ details card
 
 A Claude instance that talks to a custom endpoint (a CLI proxy) cannot read
 subscription limits itself, so the thread details card only said
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 new file mode 100644
-index 0000000000..b14b2c8cb6
+index 00000000000..b14b2c8cb67
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 @@ -0,0 +1,164 @@
@@ -193,7 +193,7 @@ index 0000000000..b14b2c8cb6
 +});
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 new file mode 100644
-index 0000000000..7b3c5b1a41
+index 00000000000..7b3c5b1a417
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 @@ -0,0 +1,83 @@
@@ -281,7 +281,7 @@ index 0000000000..7b3c5b1a41
 +  return own && notice !== null ? { kind: "notice", notice } : null;
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index 05211d6ace..afce18bc4f 100644
+index f3ee87e1b7f..4e40bb81931 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 @@ -5,10 +5,9 @@ import type {
@@ -296,7 +296,7 @@ index 05211d6ace..afce18bc4f 100644
    paceOf,
    remainingPercent,
  } from "@t3tools/shared/usageLimits";
-@@ -22,6 +21,7 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
+@@ -23,6 +22,7 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
  import { ThreadDetailsSection } from "./ThreadDetailsSection";
@@ -304,7 +304,7 @@ index 05211d6ace..afce18bc4f 100644
  
  const PACE_LABEL: Record<LimitPace, string> = {
    ahead: "Ahead of pace",
-@@ -46,17 +46,8 @@ export function ThreadDetailsUsage({
+@@ -47,17 +47,8 @@ export function ThreadDetailsUsage({
  }: Omit<ThreadDetailsUsageInput, "contextWindow">) {
    const nowMinute = useNowMinute();
    const now = Date.parse(`${nowMinute}:00Z`);
@@ -323,7 +323,7 @@ index 05211d6ace..afce18bc4f 100644
  
    return (
      <ThreadDetailsSection
-@@ -65,16 +56,28 @@ export function ThreadDetailsUsage({
+@@ -66,16 +57,28 @@ export function ThreadDetailsUsage({
        showHeading={false}
      >
        <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
@@ -355,7 +355,7 @@ index 05211d6ace..afce18bc4f 100644
          )}
        </div>
      </ThreadDetailsSection>
-@@ -173,6 +176,52 @@ function LimitRow({
+@@ -174,6 +177,52 @@ function LimitRow({
    );
  }
  

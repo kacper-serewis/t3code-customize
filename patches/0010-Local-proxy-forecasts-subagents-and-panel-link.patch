@@ -1,0 +1,864 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Mon, 2 Nov 2026 23:50:43 +0100
+Subject: [PATCH 10/11] Local: proxy forecasts, subagents and panel link
+
+- Usage page, wide layout: each account segment carries its week sparkline
+  and a "next" badge on the account the proxy gives the next new chat, which
+  the compact rows show as well.
+- Forecasts: the proxy already sends each account's demand forecast. When it
+  says a window runs dry before its reset, the thread card shows a Forecast
+  row for the routed account, the segment popover a Forecast line, and the
+  Usage notices name the account and when.
+- Subagents fold into their parent chat per account, and the thread card
+  shows how many ran and on which accounts.
+- An "Open panel" card links to the proxy's management panel.
+- A proxy on this machine without a configured label is called "CLI Proxy"
+  instead of its address, matching the thread card.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/server/src/usage/UsageLimitSources.ts    |  42 ++++++-
+ .../src/usage/cliproxyObservability.test.ts   |  14 ++-
+ .../server/src/usage/cliproxyObservability.ts |  24 +++-
+ .../components/chat/ThreadDetailsUsage.tsx    |  94 ++++++++++++++
+ .../components/usage/UsageLimitsPooled.tsx    |  54 +++++++-
+ .../usage/proxyObservability.test.ts          |  63 ++++++++++
+ .../components/usage/proxyObservability.ts    |  54 +++++++-
+ apps/web/src/lib/proxyRouting.test.ts         | 119 ++++++++++++++++++
+ apps/web/src/lib/proxyRouting.ts              |  53 ++++++++
+ packages/contracts/src/providerUsageLimits.ts |  14 +++
+ 10 files changed, 520 insertions(+), 11 deletions(-)
+ create mode 100644 apps/web/src/lib/proxyRouting.test.ts
+
+diff --git a/apps/server/src/usage/UsageLimitSources.ts b/apps/server/src/usage/UsageLimitSources.ts
+index 3a2bd80a452..4e91decfe85 100644
+--- a/apps/server/src/usage/UsageLimitSources.ts
++++ b/apps/server/src/usage/UsageLimitSources.ts
+@@ -40,11 +40,16 @@ export class UsageLimitSources extends Context.Service<
+   }
+ >()("t3/usage/UsageLimitSources") {}
+ 
++const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
++
+ function sourceLabel(id: string, config: UsageLimitSourceConfig): string {
+   if (config.label) return config.label;
+   const fallback = id.trim() || "Usage limit source";
+   try {
+-    return new URL(config.url).host || fallback;
++    const url = new URL(config.url);
++    // A proxy on this machine reads better by what it is than by its port.
++    if (LOOPBACK_HOSTS.has(url.hostname)) return "CLI Proxy";
++    return url.host || fallback;
+   } catch {
+     return fallback;
+   }
+@@ -60,20 +65,41 @@ const OBSERVABILITY_INTERVAL = Duration.seconds(60);
+ 
+ type Observability = Pick<UsageLimitSourceSnapshot, "routing" | "history" | "health">;
+ 
++function panelUrl(config: UsageLimitSourceConfig): string | undefined {
++  try {
++    const base = new URL(config.url);
++    base.pathname = base.pathname.replace(/(\/management\.html)?\/?$/i, "/");
++    return new URL("management.html", base).href;
++  } catch {
++    return undefined;
++  }
++}
++
+ function withObservability(
+   snapshot: UsageLimitSourceSnapshot,
+   observed: { readonly [K in keyof Observability]: Observability[K] | undefined },
++  config: UsageLimitSourceConfig,
+ ): UsageLimitSourceSnapshot {
+-  const { routing: _routing, history: _history, health: _health, ...rest } = snapshot;
++  const {
++    routing: _routing,
++    history: _history,
++    health: _health,
++    panelUrl: _panelUrl,
++    ...rest
++  } = snapshot;
++  const panel = observes(observed) ? panelUrl(config) : undefined;
+   return {
+     ...rest,
++    ...(panel ? { panelUrl: panel } : {}),
+     ...(observed.routing ? { routing: observed.routing } : {}),
+     ...(observed.history ? { history: observed.history } : {}),
+     ...(observed.health ? { health: observed.health } : {}),
+   };
+ }
+ 
+-const observes = (observed: Observability) =>
++const observes = (observed: {
++  readonly [K in keyof Observability]: Observability[K] | undefined;
++}) =>
+   observed.routing !== undefined || observed.history !== undefined || observed.health !== undefined;
+ 
+ /** @public */
+@@ -115,9 +141,13 @@ export const make = Effect.gen(function* () {
+     else withoutObservability.add(id);
+     if (accounts._tag === "Failure") {
+       yield* Effect.logDebug("usage limit source read failed", { id, cause: accounts.failure });
+-      return withObservability({ ...base, accounts: [], error: accounts.failure.detail }, observed);
++      return withObservability(
++        { ...base, accounts: [], error: accounts.failure.detail },
++        observed,
++        config,
++      );
+     }
+-    return withObservability({ ...base, accounts: accounts.success }, observed);
++    return withObservability({ ...base, accounts: accounts.success }, observed, config);
+   });
+ 
+   const publish = Effect.fn("UsageLimitSources.publish")(function* (
+@@ -162,7 +192,7 @@ export const make = Effect.gen(function* () {
+           const managementKey = yield* readManagementKey(config);
+           if (managementKey.length === 0) return snapshot;
+           const observed = yield* api.readObservability({ url: config.url, managementKey });
+-          return observes(observed) ? withObservability(snapshot, observed) : snapshot;
++          return observes(observed) ? withObservability(snapshot, observed, config) : snapshot;
+         }),
+       { concurrency: 4 },
+     );
+diff --git a/apps/server/src/usage/cliproxyObservability.test.ts b/apps/server/src/usage/cliproxyObservability.test.ts
+index ae9b8d6416e..83aed788234 100644
+--- a/apps/server/src/usage/cliproxyObservability.test.ts
++++ b/apps/server/src/usage/cliproxyObservability.test.ts
+@@ -20,8 +20,9 @@ describe("toRouting", () => {
+           switches: [{ at: "2026-11-02T20:30:00+01:00", from: "home.json", to: "spare.json" }],
+         },
+         {
+-          id: "claude:abc-sub",
++          id: "claude:abc:agent:a1b2c3",
+           agent: "a1b2c3",
++          parent: "claude:abc",
+           provider: "claude",
+           auth: "home.json",
+           model: "claude-haiku-5-5",
+@@ -44,7 +45,14 @@ describe("toRouting", () => {
+               fresh: true,
+               eligible: true,
+               draining: false,
+-              short: { used: 0.1, reserve: 0.2, spare: 0.7, forecast: 0.15, learning: true },
++              short: {
++                used: 0.1,
++                reserve: 0.2,
++                spare: 0.7,
++                forecast: 0.15,
++                recent_rate: 0.02,
++                learning: true,
++              },
+               long: {
+                 used: 0.4,
+                 reserve: 0.5,
+@@ -73,6 +81,7 @@ describe("toRouting", () => {
+           firstSeen: "2026-11-02T19:00:00.000Z",
+           lastSeen: "2026-11-02T20:00:00.000Z",
+           switches: [{ at: "2026-11-02T19:30:00.000Z", from: "home.json", to: "spare.json" }],
++          subagents: [{ accountId: "home.json", agents: 1, requests: 1 }],
+         },
+       ],
+       next: [
+@@ -94,6 +103,7 @@ describe("toRouting", () => {
+                   reserve: 0.2,
+                   spare: 0.7,
+                   forecast: 0.15,
++                  recentRate: 0.02,
+                   learning: true,
+                   inactive: false,
+                 },
+diff --git a/apps/server/src/usage/cliproxyObservability.ts b/apps/server/src/usage/cliproxyObservability.ts
+index b98a2b1cb2c..60098146968 100644
+--- a/apps/server/src/usage/cliproxyObservability.ts
++++ b/apps/server/src/usage/cliproxyObservability.ts
+@@ -52,6 +52,7 @@ function adaptiveWindow(value: unknown): UsageLimitSourceAdaptiveWindow | undefi
+   const reserve = number(window.reserve);
+   const spare = number(window.spare);
+   const forecast = number(window.forecast);
++  const recentRate = number(window.recent_rate);
+   if (used === undefined || reserve === undefined || spare === undefined) return undefined;
+   const reset = isoTime(window.reset);
+   return {
+@@ -59,6 +60,7 @@ function adaptiveWindow(value: unknown): UsageLimitSourceAdaptiveWindow | undefi
+     reserve,
+     spare,
+     forecast: forecast ?? 0,
++    ...(recentRate !== undefined ? { recentRate } : {}),
+     learning: bool(window.learning),
+     inactive: bool(window.inactive),
+     ...(reset ? { reset } : {}),
+@@ -97,6 +99,21 @@ function routingCandidate(value: unknown): UsageLimitSourceRoutingCandidate | un
+ export function toRouting(raw: unknown): UsageLimitSourceRouting | undefined {
+   const body = record(raw);
+   if (!body || !Array.isArray(body.sessions)) return undefined;
++  // Subagents fold into their parent chat, one entry per account that served them.
++  const subagents = new Map<string, Map<string, { agents: number; requests: number }>>();
++  for (const value of list(body.sessions)) {
++    const session = record(value);
++    const agent = text(session?.agent);
++    const parent = text(session?.parent);
++    const accountId = text(session?.auth);
++    if (!session || !parent || !accountId || agent === undefined || agent === "main") continue;
++    const byAccount = subagents.get(parent) ?? new Map();
++    subagents.set(parent, byAccount);
++    const entry = byAccount.get(accountId) ?? { agents: 0, requests: 0 };
++    entry.agents += 1;
++    entry.requests += Math.max(0, Math.trunc(number(session.requests) ?? 0));
++    byAccount.set(accountId, entry);
++  }
+   const sessions = list(body.sessions).flatMap((value) => {
+     const session = record(value);
+     const id = text(session?.id);
+@@ -105,7 +122,7 @@ export function toRouting(raw: unknown): UsageLimitSourceRouting | undefined {
+     const firstSeen = isoTime(session?.first_seen);
+     const lastSeen = isoTime(session?.last_seen);
+     if (!session || !id || !accountId || !driver || !firstSeen || !lastSeen) return [];
+-    // Threads map to main sessions only; subagents and one-off calls would only add weight.
++    // Threads map to main sessions; subagents are counted on their parent above.
+     const sessionAgent = text(session.agent);
+     if (sessionAgent !== undefined && sessionAgent !== "main") return [];
+     const switches = list(session.switches).flatMap((entry) => {
+@@ -118,6 +135,10 @@ export function toRouting(raw: unknown): UsageLimitSourceRouting | undefined {
+     const client = text(session.client);
+     const agent = text(session.agent);
+     const parent = text(session.parent);
++    const children = [...(subagents.get(id) ?? [])].map(([childAccount, entry]) => ({
++      accountId: childAccount,
++      ...entry,
++    }));
+     return [
+       {
+         id,
+@@ -131,6 +152,7 @@ export function toRouting(raw: unknown): UsageLimitSourceRouting | undefined {
+         ...(client ? { client } : {}),
+         ...(agent ? { agent } : {}),
+         ...(parent ? { parent } : {}),
++        ...(children.length > 0 ? { subagents: children } : {}),
+       },
+     ];
+   });
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+index fec7dee3d29..61527407bab 100644
+--- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+@@ -26,6 +26,9 @@ import {
+   describeAdaptiveReason,
+   describeAdaptiveWindow,
+   isRecentSwitch,
++  projectRunOut,
++  proxyAccountCandidate,
++  summarizeSubagents,
+ } from "../../lib/proxyRouting";
+ import { resolveThreadDetailsUsage, type ThreadDetailsRoute } from "./ThreadDetailsUsage.logic";
+ 
+@@ -72,6 +75,8 @@ export function ThreadDetailsUsage({
+     >
+       <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
+         {route ? <ProxyRouteRow route={route} now={now} /> : null}
++        {route ? <ProxyForecastRow route={route} now={now} /> : null}
++        {route?.kind === "session" ? <ProxySubagentsRow route={route} /> : null}
+         {!limits ? null : limits.kind === "notice" ? (
+           <UsageRow
+             label="Limits"
+@@ -265,6 +270,95 @@ function ProxyRouteRow({
+   );
+ }
+ 
++/** Shown only when the proxy's forecast has the routed account running dry before a reset. */
++function ProxyForecastRow({
++  route,
++  now,
++}: {
++  readonly route: ThreadDetailsRoute;
++  readonly now: number;
++}) {
++  const adaptive = proxyAccountCandidate(route.source, route.account.id)?.adaptive;
++  const projections = (
++    [
++      ["5h", "short"],
++      ["Weekly", "long"],
++    ] as const
++  ).flatMap(([label, kind]) => {
++    const window = adaptive?.[kind];
++    const projection = projectRunOut(window, kind, now);
++    return projection ? [{ label, projection, learning: window?.learning ?? false }] : [];
++  });
++  const soonest = projections.toSorted(
++    (left, right) => left.projection.runsOutAt - right.projection.runsOutAt,
++  )[0];
++  if (!soonest) return null;
++  const exhausted = soonest.projection.exhausted;
++  const value = exhausted
++    ? "Out"
++    : `~${formatDuration(Math.max(60_000, soonest.projection.runsOutAt - now))}`;
++  return (
++    <UsageRow
++      label="Forecast"
++      fill={null}
++      tone={exhausted ? "error" : "warning"}
++      value={value}
++      ariaValue={exhausted ? "out of quota" : `runs out in ${value.slice(1)}`}
++      tooltip={
++        <>
++          <span className="text-foreground">
++            {route.account.label} is likely to run out before a reset
++          </span>
++          {projections.map(({ label, projection, learning }) => (
++            <span key={label} className="text-muted-foreground">
++              {projection.exhausted
++                ? `${label}: out until it resets in ${formatDuration(projection.resetAt - now)}`
++                : `${label}: at this pace it runs out in ${formatDuration(
++                    Math.max(60_000, projection.runsOutAt - now),
++                  )}, ${formatDuration(projection.resetAt - projection.runsOutAt)} before it resets`}
++              {learning ? " (still learning usage)" : ""}
++            </span>
++          ))}
++          <span className="text-muted-foreground">Forecast by {route.source.label}</span>
++        </>
++      }
++    />
++  );
++}
++
++/** The chat's subagents and the accounts that served them. */
++function ProxySubagentsRow({
++  route,
++}: {
++  readonly route: Extract<ThreadDetailsRoute, { kind: "session" }>;
++}) {
++  const { entries, agents } = summarizeSubagents(route);
++  if (agents === 0) return null;
++  const accounts = entries.map((entry) => entry.account.label).join(", ");
++  return (
++    <UsageRow
++      label="Subagents"
++      fill={null}
++      tone={null}
++      value={`${agents} · ${accounts}`}
++      ariaValue={`${agents} subagents on ${accounts}`}
++      tooltip={
++        <>
++          <span className="text-foreground">
++            {agents} {agents === 1 ? "subagent" : "subagents"} in this chat
++          </span>
++          {entries.map((entry) => (
++            <span key={entry.accountId} className="text-muted-foreground">
++              {entry.account.email ?? entry.account.label}: {entry.agents}{" "}
++              {entry.agents === 1 ? "agent" : "agents"}, {entry.requests} requests
++            </span>
++          ))}
++        </>
++      }
++    />
++  );
++}
++
+ /** A window pooled across a proxy's accounts; it reads like the Usage page's summary. */
+ function PooledLimitRow({
+   window,
+diff --git a/apps/web/src/components/usage/UsageLimitsPooled.tsx b/apps/web/src/components/usage/UsageLimitsPooled.tsx
+index bf85f73ed43..a760872e476 100644
+--- a/apps/web/src/components/usage/UsageLimitsPooled.tsx
++++ b/apps/web/src/components/usage/UsageLimitsPooled.tsx
+@@ -6,6 +6,7 @@ import {
+   collectLimitPools,
+   cursorUsageWindowDetails,
+   displayLimitWindows,
++  formatDuration,
+   formatResetsIn,
+   type LimitAccount,
+   type LimitPool,
+@@ -47,14 +48,26 @@ import {
+   resetCreditsSummary,
+   useResetCredit,
+ } from "./UsageLimits";
+-import { describeAdaptiveWindow } from "../../lib/proxyRouting";
++import { describeAdaptiveWindow, projectRunOut } from "../../lib/proxyRouting";
+ import {
++  collectProxyForecastNotices,
+   collectProxyHealthNotices,
+   collectProxyObservability,
++  collectProxyPanels,
++  marksNextChat,
+   type ProxyAccountObservability,
+   windowAdaptive,
+   windowHistory,
+ } from "./proxyObservability";
++
++function NextChatBadge() {
++  return (
++    <span className="shrink-0 rounded-sm bg-background/85 px-1 py-0.5 text-2xs font-medium text-foreground">
++      <span aria-hidden>next</span>
++      <span className="sr-only">, gets the next new chat</span>
++    </span>
++  );
++}
+ import { UsageSparkline, UsageSparklineMini } from "./UsageSparkline";
+ 
+ /** Routing and history a proxy fork reports, keyed by pooled account key. */
+@@ -247,6 +260,7 @@ function ProxyAccountDetails({
+   const history = windowHistory(observed, window);
+   const adaptive = windowAdaptive(observed, window);
+   const spare = describeAdaptiveWindow("Spare", adaptive)?.replace("Spare: ", "");
++  const projection = projectRunOut(adaptive, window.kind === "session" ? "short" : "long", now);
+   if (history.length < 2 && !spare && !observed.isNext) return null;
+   return (
+     <div className="flex flex-col gap-2 border-t border-border/60 pt-2.5">
+@@ -257,6 +271,17 @@ function ProxyAccountDetails({
+         formatAt={(at) => formatUpcomingTimestamp(new Date(at).toISOString(), timestampFormat, now)}
+       />
+       {spare ? <Row label="Proxy">{spare}</Row> : null}
++      {projection ? (
++        <Row label="Forecast">
++          <span
++            className={projection.exhausted ? "text-error-foreground" : "text-warning-foreground"}
++          >
++            {projection.exhausted
++              ? "Out until the reset"
++              : `Runs out in ~${formatDuration(Math.max(60_000, projection.runsOutAt - now))}, before the reset`}
++          </span>
++        </Row>
++      ) : null}
+       {observed.isNext ? <Row label="Routing">Gets the next new chat</Row> : null}
+     </div>
+   );
+@@ -388,6 +413,7 @@ function SegmentTriggers({
+   readonly showAccountName: boolean;
+ }) {
+   const popover = use(SegmentPopoverContext) ?? undefined;
++  const observed = use(ProxyObservabilityContext).get(account.key);
+   const payload: SegmentPayload = { account, window, reset, redeem };
+   const remaining = remainingPercent(window);
+   const timeLeft = paceRemainingPercent(window, now);
+@@ -456,6 +482,8 @@ function SegmentTriggers({
+               {remaining}%
+             </span>
+           ) : null}
++          <UsageSparklineMini points={windowHistory(observed, window)} now={now} />
++          {observed?.isNext && marksNextChat(window, account.driver) ? <NextChatBadge /> : null}
+           {resetsIn || credits ? (
+             <span className="ms-auto flex min-w-0 items-center gap-1.5 overflow-hidden rounded-sm bg-background/85 px-1.5 py-0.5 text-2xs whitespace-nowrap text-foreground tabular-nums">
+               {resetsIn?.replace("resets in ", "↻ ") ?? ""}
+@@ -518,6 +546,7 @@ function LegendRow({
+       <AccountName account={account} className="min-w-0 truncate font-medium text-foreground" />
+       <span className="shrink-0 font-semibold text-foreground tabular-nums">{remaining}%</span>
+       <UsageSparklineMini points={windowHistory(observed, window)} now={now} className="ms-2" />
++      {observed?.isNext && marksNextChat(window, account.driver) ? <NextChatBadge /> : null}
+       <span className="ms-auto flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground tabular-nums">
+         {resetsIn?.replace("resets in ", "↻ ") ?? ""}
+         {credits ? (
+@@ -664,8 +693,10 @@ export function UsageLimitsPooled({
+   const pools = collectLimitPools(collectLimitAccounts(presentations), now);
+   const notices = [
+     ...collectLimitNotices(presentations),
++    ...collectProxyForecastNotices(presentations, now),
+     ...collectProxyHealthNotices(presentations),
+   ];
++  const proxyPanels = collectProxyPanels(presentations);
+   const proxyObservability = collectProxyObservability(presentations);
+   const externalLinks = collectExternalUsageLinks(presentations);
+   const cursorPromptAt =
+@@ -737,6 +768,27 @@ export function UsageLimitsPooled({
+           </Button>
+         </section>
+       ))}
++      {proxyPanels.map((panel) => (
++        <section
++          key={panel.url}
++          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4"
++        >
++          <div className="min-w-0 space-y-1">
++            <h2 className="text-sm font-medium">{panel.label} panel</h2>
++            <p className="text-xs break-words text-muted-foreground">
++              Routing, quota history and updates for the proxy's accounts.
++            </p>
++          </div>
++          <Button
++            variant="ghost-muted"
++            size="xs"
++            onClick={() => void ensureLocalApi().shell.openExternal(panel.url)}
++          >
++            Open panel
++            <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
++          </Button>
++        </section>
++      ))}
+       <LimitNotices notices={notices} />
+     </div>
+   );
+diff --git a/apps/web/src/components/usage/proxyObservability.test.ts b/apps/web/src/components/usage/proxyObservability.test.ts
+index 219eb9b8901..eaf7089fdae 100644
+--- a/apps/web/src/components/usage/proxyObservability.test.ts
++++ b/apps/web/src/components/usage/proxyObservability.test.ts
+@@ -9,8 +9,11 @@ import type { LimitPresentations } from "@t3tools/shared/usageLimits";
+ import { describe, expect, it } from "vite-plus/test";
+ 
+ import {
++  collectProxyForecastNotices,
+   collectProxyHealthNotices,
+   collectProxyObservability,
++  collectProxyPanels,
++  marksNextChat,
+   windowAdaptive,
+   windowHistory,
+ } from "./proxyObservability";
+@@ -138,3 +141,63 @@ describe("collectProxyHealthNotices", () => {
+     ]);
+   });
+ });
++
++describe("forecasts and panels", () => {
++  const now = Date.parse(checkedAt);
++  const forecasting: UsageLimitSourceSnapshot = {
++    ...source,
++    panelUrl: "http://127.0.0.1:8317/management.html",
++    routing: {
++      sessions: [],
++      next: [
++        {
++          driver: claude,
++          candidates: [
++            {
++              accountId: "cs.json",
++              unavailable: false,
++              saturated: false,
++              adaptive: {
++                reason: "home",
++                home: true,
++                fresh: true,
++                eligible: true,
++                draining: false,
++                short: {
++                  used: 0.6,
++                  reserve: 0.65,
++                  spare: -0.25,
++                  forecast: 0.6,
++                  learning: false,
++                  inactive: false,
++                  reset: new Date(now + 4 * 3_600_000).toISOString(),
++                },
++              },
++            },
++          ],
++        },
++      ],
++    },
++  };
++
++  it("warns about accounts the proxy expects to run dry before a reset", () => {
++    expect(collectProxyForecastNotices(presentations([forecasting]), now)).toEqual([
++      "cs: at this pace its 5h window runs out in ~2h 40m, 1h 20m before it resets.",
++    ]);
++    expect(collectProxyForecastNotices(presentations([source]), now)).toEqual([]);
++  });
++
++  it("lists each proxy panel once", () => {
++    expect(collectProxyPanels(presentations([forecasting, forecasting]))).toEqual([
++      { label: "CLI Proxy", url: "http://127.0.0.1:8317/management.html" },
++    ]);
++  });
++
++  it("marks the next chat on the session row, or Codex's weekly row", () => {
++    expect(marksNextChat({ ...weekly, id: "five_hour", kind: "session" }, "claudeAgent")).toBe(
++      true,
++    );
++    expect(marksNextChat(weekly, "claudeAgent")).toBe(false);
++    expect(marksNextChat(weekly, "codex")).toBe(true);
++  });
++});
+diff --git a/apps/web/src/components/usage/proxyObservability.ts b/apps/web/src/components/usage/proxyObservability.ts
+index 933eed342f9..646df0fa613 100644
+--- a/apps/web/src/components/usage/proxyObservability.ts
++++ b/apps/web/src/components/usage/proxyObservability.ts
+@@ -4,7 +4,9 @@ import type {
+   UsageLimitSourceHistory,
+   UsageLimitSourceRoutingCandidate,
+ } from "@t3tools/contracts";
+-import type { LimitPresentations } from "@t3tools/shared/usageLimits";
++import { formatDuration, type LimitPresentations } from "@t3tools/shared/usageLimits";
++
++import { projectRunOut, proxyAccountRef } from "../../lib/proxyRouting";
+ 
+ type HistoryPoints = UsageLimitSourceHistory[number]["points"];
+ 
+@@ -101,3 +103,53 @@ export function collectProxyHealthNotices(presentations: LimitPresentations): re
+   }
+   return notices;
+ }
++
++/** The proxy marks its next-chat account once per account, on the row that best shows it. */
++export function marksNextChat(window: ServerProviderUsageWindow, driver: string): boolean {
++  return window.kind === "session" || (driver === "codex" && window.kind === "weekly");
++}
++
++/** Accounts the proxy's forecast has running dry before a reset, soonest first. */
++export function collectProxyForecastNotices(
++  presentations: LimitPresentations,
++  now: number,
++): readonly string[] {
++  const found: Array<{ readonly at: number; readonly text: string }> = [];
++  for (const presentation of presentations.values()) {
++    for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
++      for (const queue of source.routing?.next ?? []) {
++        for (const candidate of queue.candidates) {
++          const label = proxyAccountRef(source, candidate.accountId).label;
++          for (const [name, kind] of [
++            ["5h", "short"],
++            ["weekly", "long"],
++          ] as const) {
++            const projection = projectRunOut(candidate.adaptive?.[kind], kind, now);
++            if (!projection || projection.exhausted) continue;
++            const inMs = Math.max(60_000, projection.runsOutAt - now);
++            found.push({
++              at: projection.runsOutAt,
++              text: `${label}: at this pace its ${name} window runs out in ~${formatDuration(inMs)}, ${formatDuration(projection.resetAt - projection.runsOutAt)} before it resets.`,
++            });
++          }
++        }
++      }
++    }
++  }
++  return found.toSorted((left, right) => left.at - right.at).map((entry) => entry.text);
++}
++
++/** Management panels of proxies that serve the fork's endpoints, one per address. */
++export function collectProxyPanels(
++  presentations: LimitPresentations,
++): ReadonlyArray<{ readonly label: string; readonly url: string }> {
++  const panels = new Map<string, string>();
++  for (const presentation of presentations.values()) {
++    for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
++      if (source.panelUrl && !panels.has(source.panelUrl)) {
++        panels.set(source.panelUrl, source.label);
++      }
++    }
++  }
++  return [...panels].map(([url, label]) => ({ label, url }));
++}
+diff --git a/apps/web/src/lib/proxyRouting.test.ts b/apps/web/src/lib/proxyRouting.test.ts
+new file mode 100644
+index 00000000000..9147db8c273
+--- /dev/null
++++ b/apps/web/src/lib/proxyRouting.test.ts
+@@ -0,0 +1,119 @@
++import {
++  ProviderDriverKind,
++  type UsageLimitSourceAdaptiveWindow,
++  type UsageLimitSourceSnapshot,
++  UsageLimitSourceId,
++} from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  findProxySession,
++  nextProxyRoute,
++  projectRunOut,
++  proxySessionId,
++  summarizeSubagents,
++} from "./proxyRouting";
++
++const HOUR = 60 * 60_000;
++const now = Date.parse("2026-11-02T22:00:00.000Z");
++const claude = ProviderDriverKind.make("claudeAgent");
++
++function window(
++  overrides: Partial<UsageLimitSourceAdaptiveWindow>,
++): UsageLimitSourceAdaptiveWindow {
++  return {
++    used: 0.6,
++    reserve: 0.65,
++    spare: -0.25,
++    forecast: 0.6,
++    learning: false,
++    inactive: false,
++    reset: new Date(now + 4 * HOUR).toISOString(),
++    ...overrides,
++  };
++}
++
++describe("projectRunOut", () => {
++  it("projects the run-out time when the forecast exceeds what is left", () => {
++    // 0.6 over the 4h left is 0.15 an hour, so the remaining 0.4 lasts about 2h 40m.
++    const projection = projectRunOut(window({}), "short", now);
++    expect(projection?.exhausted).toBe(false);
++    expect(Math.round((projection!.runsOutAt - now) / 60_000)).toBe(160);
++    expect(projection?.resetAt).toBe(now + 4 * HOUR);
++  });
++
++  it("stays quiet when the forecast fits before the reset", () => {
++    expect(projectRunOut(window({ forecast: 0.3 }), "short", now)).toBeNull();
++    expect(projectRunOut(window({ inactive: true }), "short", now)).toBeNull();
++    expect(projectRunOut(window({ reset: undefined }), "short", now)).toBeNull();
++  });
++
++  it("reports a spent window as out until its reset", () => {
++    expect(projectRunOut(window({ used: 1 }), "long", now)).toEqual({
++      runsOutAt: now,
++      resetAt: now + 4 * HOUR,
++      exhausted: true,
++    });
++  });
++});
++
++const source: UsageLimitSourceSnapshot = {
++  id: UsageLimitSourceId.make("hub"),
++  kind: "cliproxy",
++  label: "CLI Proxy",
++  checkedAt: "2026-11-02T22:00:00.000Z",
++  accounts: [
++    {
++      id: "claude@example.com.json",
++      driver: claude,
++      email: "claude@example.com",
++      usageLimits: { checkedAt: "2026-11-02T22:00:00.000Z", windows: [] },
++    },
++  ],
++  routing: {
++    sessions: [
++      {
++        id: proxySessionId(claude, "abc"),
++        driver: claude,
++        accountId: "claude@example.com.json",
++        model: "claude-opus-5-5",
++        requests: 10,
++        firstSeen: "2026-11-02T21:00:00.000Z",
++        lastSeen: "2026-11-02T21:59:00.000Z",
++        switches: [],
++        subagents: [
++          { accountId: "other@example.com.json", agents: 1, requests: 3 },
++          { accountId: "claude@example.com.json", agents: 2, requests: 30 },
++        ],
++      },
++    ],
++    next: [
++      {
++        driver: claude,
++        candidates: [
++          { accountId: "cooling.json", unavailable: true, saturated: false },
++          { accountId: "claude@example.com.json", unavailable: false, saturated: true },
++        ],
++      },
++    ],
++  },
++};
++
++describe("routes", () => {
++  it("finds a chat by the native session id and labels its account", () => {
++    const route = findProxySession([source], claude, "abc");
++    expect(route?.account).toMatchObject({ label: "claude", email: "claude@example.com" });
++    expect(findProxySession([source], ProviderDriverKind.make("codex"), "abc")).toBeNull();
++    expect(findProxySession([source], claude, null)).toBeNull();
++  });
++
++  it("summarizes subagents busiest account first, labelling accounts without a record", () => {
++    const summary = summarizeSubagents(findProxySession([source], claude, "abc")!);
++    expect(summary.agents).toBe(3);
++    expect(summary.entries.map((entry) => entry.account.label)).toEqual(["claude", "other"]);
++  });
++
++  it("takes the first account not cooling down, even a saturated last resort", () => {
++    expect(nextProxyRoute([source], claude)?.account.id).toBe("claude@example.com.json");
++  });
++});
+diff --git a/apps/web/src/lib/proxyRouting.ts b/apps/web/src/lib/proxyRouting.ts
+index 230ea8e93ee..f957f4dbaae 100644
+--- a/apps/web/src/lib/proxyRouting.ts
++++ b/apps/web/src/lib/proxyRouting.ts
+@@ -111,3 +111,56 @@ export function describeAdaptiveWindow(
+   const learning = window.learning ? " (still learning usage)" : "";
+   return `${label}: ${share(window.spare)} spare after a ${share(window.reserve)} reserve, ${share(window.used)} used${learning}`;
+ }
++
++const HOUR_MS = 60 * 60_000;
++
++export interface RunOutProjection {
++  readonly runsOutAt: number;
++  readonly resetAt: number;
++  /** Already out of quota until the reset. */
++  readonly exhausted: boolean;
++}
++
++/**
++ * When the proxy's own demand forecast says a window runs dry before it resets, and roughly when.
++ * The forecast is the usage expected until the reset (or the proxy's horizon), as a share.
++ */
++export function projectRunOut(
++  window: UsageLimitSourceAdaptiveWindow | undefined,
++  kind: "short" | "long",
++  now: number,
++): RunOutProjection | null {
++  if (!window || window.inactive || !window.reset) return null;
++  const resetAt = Date.parse(window.reset);
++  if (!Number.isFinite(resetAt) || resetAt <= now) return null;
++  if (window.used >= 1) return { runsOutAt: now, resetAt, exhausted: true };
++  if (window.used + window.forecast < 1) return null;
++  const horizonHours = Math.min((resetAt - now) / HOUR_MS, kind === "short" ? 5 : 7 * 24);
++  const rate = window.forecast / horizonHours;
++  if (!(rate > 0)) return null;
++  const runsOutAt = now + ((1 - window.used) / rate) * HOUR_MS;
++  return runsOutAt < resetAt ? { runsOutAt, resetAt, exhausted: false } : null;
++}
++
++/** Subagents of a chat, busiest account first, with labels for the accounts. */
++export function summarizeSubagents(route: ProxySessionRoute) {
++  const entries = (route.session.subagents ?? [])
++    .map((entry) => ({ ...entry, account: proxyAccountRef(route.source, entry.accountId) }))
++    .toSorted((left, right) => right.requests - left.requests);
++  return {
++    entries,
++    agents: entries.reduce((sum, entry) => sum + entry.agents, 0),
++  };
++}
++
++/** The proxy's adaptive view of one account, from its next-chat queue. */
++export function proxyAccountCandidate(
++  source: UsageLimitSourceSnapshot,
++  accountId: string,
++): UsageLimitSourceRoutingCandidate | undefined {
++  for (const queue of source.routing?.next ?? []) {
++    const candidate = queue.candidates.find((entry) => entry.accountId === accountId);
++    if (candidate) return candidate;
++  }
++  return undefined;
++}
+diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
+index 09cbe6dd1d3..02d721b5d76 100644
+--- a/packages/contracts/src/providerUsageLimits.ts
++++ b/packages/contracts/src/providerUsageLimits.ts
+@@ -90,6 +90,16 @@ export const UsageLimitSourceRoutingSession = Schema.Struct({
+   switches: Schema.Array(
+     Schema.Struct({ at: IsoDateTime, from: Schema.String, to: Schema.String }),
+   ),
++  /** The chat's subagents, grouped by the account that served them. */
++  subagents: Schema.optional(
++    Schema.Array(
++      Schema.Struct({
++        accountId: TrimmedNonEmptyString,
++        agents: NonNegativeInt,
++        requests: NonNegativeInt,
++      }),
++    ),
++  ),
+ });
+ export type UsageLimitSourceRoutingSession = typeof UsageLimitSourceRoutingSession.Type;
+ 
+@@ -100,6 +110,8 @@ export const UsageLimitSourceAdaptiveWindow = Schema.Struct({
+   reserve: Schema.Number,
+   spare: Schema.Number,
+   forecast: Schema.Number,
++  /** Share of the window used per hour lately. */
++  recentRate: Schema.optional(Schema.Number),
+   learning: Schema.Boolean,
+   inactive: Schema.Boolean,
+ });
+@@ -178,6 +190,8 @@ export const UsageLimitSourceSnapshot = Schema.Struct({
+   routing: Schema.optional(UsageLimitSourceRouting),
+   history: Schema.optional(UsageLimitSourceHistory),
+   health: Schema.optional(UsageLimitSourceHealth),
++  /** The fork's management panel, as reachable from the server's machine. */
++  panelUrl: Schema.optional(Schema.String),
+ });
+ export type UsageLimitSourceSnapshot = typeof UsageLimitSourceSnapshot.Type;
+ 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:06:07 +0200
-Subject: [PATCH 4/9] Suggest the same model on a subscription with more room
+Subject: [PATCH 04/11] Suggest the same model on a subscription with more room
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -24,10 +24,10 @@ explains why and when a started thread cannot switch.
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index e473479bd9..b1448ca05b 100644
+index ee10cf66cf4..11684c52d2e 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -219,6 +219,8 @@ import {
+@@ -224,6 +224,8 @@ import {
    type ComposerImageAttachment,
    type DraftThreadEnvMode,
    useComposerDraftStore,
@@ -36,7 +36,7 @@ index e473479bd9..b1448ca05b 100644
    DraftId,
  } from "../composerDraftStore";
  import { type TerminalContextDraft } from "../lib/terminalContext";
-@@ -1459,6 +1461,17 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1470,6 +1472,17 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderThread,
    );
    const activeUsageLimits = activeProviderStatus?.usageLimits;
@@ -54,7 +54,7 @@ index e473479bd9..b1448ca05b 100644
    const activeProviderName =
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
-@@ -3874,6 +3887,13 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3921,6 +3934,13 @@ export default function ChatView(props: ChatViewProps) {
                                    : compactDisabledReason
                            }
                            isCompacting={isCompacting}
@@ -69,7 +69,7 @@ index e473479bd9..b1448ca05b 100644
                        )}
                        <div
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 5b136e2a39..0b6c6b4ce0 100644
+index fe42f034996..7d61a0f25eb 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -1,5 +1,7 @@
@@ -80,7 +80,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
    ServerProviderUsageLimits,
    ServerProviderUsageWindow,
  } from "@t3tools/contracts";
-@@ -26,6 +28,7 @@ import {
+@@ -27,6 +29,7 @@ import {
    selectComposerLimitWindows,
    type RecordedCompaction,
  } from "./ComposerStats.logic";
@@ -88,7 +88,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
  
  function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
    const textRef = useRef<HTMLSpanElement>(null);
-@@ -275,6 +278,68 @@ function UsageLimitsSummary({
+@@ -276,6 +279,68 @@ function UsageLimitsSummary({
    );
  }
  
@@ -157,7 +157,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
  export function ComposerStats({
    context,
    turn,
-@@ -286,6 +351,7 @@ export function ComposerStats({
+@@ -287,6 +352,7 @@ export function ComposerStats({
    compactDisabled,
    compactDisabledReason,
    isCompacting,
@@ -165,7 +165,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
  }: {
    context: ContextWindowSnapshot | null;
    turn: OrchestrationV2ProviderTurn | null;
-@@ -297,6 +363,7 @@ export function ComposerStats({
+@@ -298,6 +364,7 @@ export function ComposerStats({
    compactDisabled: boolean;
    compactDisabledReason: string | null;
    isCompacting: boolean;
@@ -173,7 +173,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
  }) {
    const compaction = deriveContextCompaction(context, contextDriver, configuredClaudeThreshold);
    const responseRate = deriveResponseRate(turn);
-@@ -317,6 +384,7 @@ export function ComposerStats({
+@@ -318,6 +385,7 @@ export function ComposerStats({
      responseRate === null &&
      compactions.length === 0 &&
      selectComposerLimitWindows(usageLimits?.limits).length === 0 &&
@@ -181,7 +181,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
      compactDisabled
    )
      return null;
-@@ -577,6 +645,7 @@ export function ComposerStats({
+@@ -578,6 +646,7 @@ export function ComposerStats({
        {usageLimits && (
          <UsageLimitsSummary limits={usageLimits.limits} providerName={usageLimits.providerName} />
        )}
@@ -191,7 +191,7 @@ index 5b136e2a39..0b6c6b4ce0 100644
            {stats.map(({ key, node }, index) => (
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 new file mode 100644
-index 0000000000..da5f1aa6e4
+index 00000000000..da5f1aa6e43
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 @@ -0,0 +1,226 @@
@@ -423,7 +423,7 @@ index 0000000000..da5f1aa6e4
 +});
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 new file mode 100644
-index 0000000000..af475f0b2a
+index 00000000000..af475f0b2aa
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -0,0 +1,225 @@

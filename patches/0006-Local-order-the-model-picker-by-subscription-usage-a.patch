@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:16:17 +0200
-Subject: [PATCH 6/9] Local: order the model picker by subscription usage and
+Subject: [PATCH 06/11] Local: order the model picker by subscription usage and
  show 5h/weekly limits
 
 ---
@@ -16,7 +16,7 @@ Subject: [PATCH 6/9] Local: order the model picker by subscription usage and
  create mode 100644 apps/web/src/components/chat/ModelPickerUsage.logic.ts
 
 diff --git a/apps/web/src/components/chat/ModelListRow.tsx b/apps/web/src/components/chat/ModelListRow.tsx
-index e70c32b064..d19357c86f 100644
+index 69da770f1f8..3838eed5d5a 100644
 --- a/apps/web/src/components/chat/ModelListRow.tsx
 +++ b/apps/web/src/components/chat/ModelListRow.tsx
 @@ -10,6 +10,30 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -59,16 +59,16 @@ index e70c32b064..d19357c86f 100644
    acpRegistryAgentId?: string | undefined;
    acpRegistryIconUrl?: string | undefined;
    isFavorite: boolean;
-@@ -100,6 +126,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
+@@ -101,6 +127,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
        </div>
  
        <div className="flex shrink-0 items-center gap-1.5">
 +        {props.usage ? <ModelRowUsage usage={props.usage} /> : null}
-         {props.jumpLabel ? <Kbd>{props.jumpLabel}</Kbd> : null}
          <Tooltip>
            <TooltipTrigger
+             render={
 diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
-index f040df764c..ea00634a7c 100644
+index f040df764cd..ea00634a7c7 100644
 --- a/apps/web/src/components/chat/ModelPickerContent.tsx
 +++ b/apps/web/src/components/chat/ModelPickerContent.tsx
 @@ -64,6 +64,7 @@ import {
@@ -140,7 +140,7 @@ index f040df764c..ea00634a7c 100644
                      acpRegistryIconUrl={model.acpRegistryIconUrl}
                      isFavorite={favoritesSet.has(providerModelKey(model.instanceId, model.slug))}
 diff --git a/apps/web/src/components/chat/ModelPickerSidebar.tsx b/apps/web/src/components/chat/ModelPickerSidebar.tsx
-index c07b1f33c5..5ffda67767 100644
+index c07b1f33c5f..5ffda677678 100644
 --- a/apps/web/src/components/chat/ModelPickerSidebar.tsx
 +++ b/apps/web/src/components/chat/ModelPickerSidebar.tsx
 @@ -3,6 +3,7 @@ import { type ProviderInstanceId } from "@t3tools/contracts";
@@ -207,7 +207,7 @@ index c07b1f33c5..5ffda67767 100644
  
 diff --git a/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts b/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
 new file mode 100644
-index 0000000000..3bf7760262
+index 00000000000..3bf77602627
 --- /dev/null
 +++ b/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
 @@ -0,0 +1,101 @@
@@ -314,7 +314,7 @@ index 0000000000..3bf7760262
 +});
 diff --git a/apps/web/src/components/chat/ModelPickerUsage.logic.ts b/apps/web/src/components/chat/ModelPickerUsage.logic.ts
 new file mode 100644
-index 0000000000..3422ddaf51
+index 00000000000..3422ddaf51e
 --- /dev/null
 +++ b/apps/web/src/components/chat/ModelPickerUsage.logic.ts
 @@ -0,0 +1,130 @@
@@ -449,7 +449,7 @@ index 0000000000..3422ddaf51
 +  return usage.windows.map((window) => `${window.shortLabel} ${window.percentText}`).join(" · ");
 +}
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
-index 6557fdbc01..ca93fe8bcd 100644
+index 6557fdbc015..ca93fe8bcdc 100644
 --- a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -117,7 +117,7 @@ export function assessSubscription(
