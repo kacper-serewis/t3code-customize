@@ -1,23 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tyler South <tsouth2@gmail.com>
 Date: Sat, 10 Oct 2026 12:40:14 -0400
-Subject: [PATCH 3/7] fix(web): show compaction settings and add a stats
+Subject: [PATCH 03/11] fix(web): show compaction settings and add a stats
  compact action
 
 ---
- apps/web/src/components/ChatView.tsx          | 54 +++++++++--
+ apps/web/src/components/ChatView.tsx          | 46 ++++++++-
  .../chat/ComposerStats.logic.test.ts          | 96 +++++++++++++++++++
  .../components/chat/ComposerStats.logic.ts    | 52 ++++++++++
  .../web/src/components/chat/ComposerStats.tsx | 73 ++++++++++++--
  apps/web/src/lib/contextWindow.test.ts        | 56 ++++++++++-
- apps/web/src/lib/contextWindow.ts             | 12 +--
- 6 files changed, 317 insertions(+), 26 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts | 13 +--
+ 6 files changed, 311 insertions(+), 25 deletions(-)
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 15859de44..f69f96a0f 100644
+index 18837a02598..ee10cf66cf4 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -3644,23 +3644,49 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1477,20 +1477,40 @@ export default function ChatView(props: ChatViewProps) {
      const usageLimits = activeUsageLimits
        ? { limits: activeUsageLimits, providerName: activeProviderName }
        : null;
@@ -61,19 +61,9 @@ index 15859de44..f69f96a0f 100644
 +        providerThread,
        ),
      };
--  }, [settings.statsForNerdsEnabled, serverProjection, activeUsageLimits, activeProviderName]);
-+  }, [
-+    settings.statsForNerdsEnabled,
-+    settings.providerInstances,
-+    serverProjection,
-+    activeUsageLimits,
-+    activeProviderName,
-+  ]);
-   const pendingBackgroundTasks = useMemo(() => {
-     if (serverProjection === null || serverProjection === undefined) {
-       return [];
-@@ -11973,7 +11999,23 @@ export default function ChatView(props: ChatViewProps) {
-                     </ComposerSurface.Shell>
+   })();
+@@ -3886,7 +3906,23 @@ export default function ChatView(props: ChatViewProps) {
+                     </div>
                      {/* Opaque so timeline content scrolling under the overlay can't show through the stats line. */}
                      <div className={composerStats !== null ? "bg-background" : undefined}>
 -                      {composerStats !== null && <ComposerStats {...composerStats} />}
@@ -98,7 +88,7 @@ index 15859de44..f69f96a0f 100644
                          aria-hidden
                          className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.test.ts b/apps/web/src/components/chat/ComposerStats.logic.test.ts
-index 479e94b19..79b01fd80 100644
+index 479e94b193c..79b01fd80ea 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.test.ts
 +++ b/apps/web/src/components/chat/ComposerStats.logic.test.ts
 @@ -14,6 +14,7 @@ import { describe, expect, it } from "vite-plus/test";
@@ -209,18 +199,18 @@ index 479e94b19..79b01fd80 100644
 +  });
 +});
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
-index b4f72291f..8c8236a63 100644
+index 6d748689ddb..822c604e79e 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.ts
 +++ b/apps/web/src/components/chat/ComposerStats.logic.ts
 @@ -7,6 +7,7 @@ import type {
-   TurnTokenUsage,
  } from "@t3tools/contracts";
+ import type { ThreadStructureTurnItem } from "@t3tools/client-runtime/state/shell";
  import * as DateTime from "effect/DateTime";
-+import type { ContextWindowSnapshot } from "~/lib/contextWindow";
++import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
  
  /** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
  export function selectComposerStatsTurns(projection: {
-@@ -248,3 +249,54 @@ export function composerLimitDisplay(
+@@ -250,3 +251,54 @@ export function composerLimitDisplay(
      dimmed: freshness.status !== "fresh",
    };
  }
@@ -276,13 +266,13 @@ index b4f72291f..8c8236a63 100644
 +  return { threshold, source, remainingTokens, thresholdPercentage, pressurePercentage, status };
 +}
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 025f57253..53b81a83a 100644
+index 724cafe53c9..fe42f034996 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
-@@ -10,6 +10,7 @@ import * as DateTime from "effect/DateTime";
- import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+@@ -10,6 +10,7 @@ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
  
- import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
+ import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
+ import { formatContextWindowTokens } from "~/lib/contextWindow";
 +import { Button } from "../ui/button";
  import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -295,7 +285,7 @@ index 025f57253..53b81a83a 100644
    deriveResponseRate,
    deriveTurnCachePercentage,
    formatCachePercentage,
-@@ -234,7 +236,7 @@ function UsageLimitsSummary({
+@@ -235,7 +237,7 @@ function UsageLimitsSummary({
            <button
              type="button"
              aria-label="Usage limit details"
@@ -304,7 +294,7 @@ index 025f57253..53b81a83a 100644
            />
          }
        >
-@@ -278,12 +280,25 @@ export function ComposerStats({
+@@ -279,12 +281,25 @@ export function ComposerStats({
    turn,
    compactions,
    usageLimits,
@@ -317,7 +307,7 @@ index 025f57253..53b81a83a 100644
  }: {
    context: ContextWindowSnapshot | null;
    turn: OrchestrationV2ProviderTurn | null;
-   compactions: ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>>;
+   compactions: ReadonlyArray<RecordedCompaction>;
    usageLimits: { limits: ServerProviderUsageLimits; providerName: string } | null;
 +  contextDriver: string | undefined;
 +  configuredClaudeThreshold: unknown;
@@ -330,7 +320,7 @@ index 025f57253..53b81a83a 100644
    const responseRate = deriveResponseRate(turn);
    const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
    const usage = turn?.turnTokenUsage;
-@@ -301,7 +316,8 @@ export function ComposerStats({
+@@ -302,7 +317,8 @@ export function ComposerStats({
      !hasTokens &&
      responseRate === null &&
      compactions.length === 0 &&
@@ -340,7 +330,7 @@ index 025f57253..53b81a83a 100644
    )
      return null;
    const count = (value: number | undefined) =>
-@@ -327,7 +343,7 @@ export function ComposerStats({
+@@ -328,7 +344,7 @@ export function ComposerStats({
                <button
                  type="button"
                  aria-label="Turn token details"
@@ -349,7 +339,7 @@ index 025f57253..53b81a83a 100644
                />
              }
            >
-@@ -392,7 +408,7 @@ export function ComposerStats({
+@@ -393,7 +409,7 @@ export function ComposerStats({
              render={
                <span
                  tabIndex={0}
@@ -358,7 +348,7 @@ index 025f57253..53b81a83a 100644
                />
              }
            >
-@@ -410,7 +426,7 @@ export function ComposerStats({
+@@ -411,7 +427,7 @@ export function ComposerStats({
    }
  
    // Context is per thread, so it sits with the turn stats; the left side is account limits.
@@ -367,7 +357,7 @@ index 025f57253..53b81a83a 100644
      stats.unshift({
        key: "context",
        node: (
-@@ -423,13 +439,13 @@ export function ComposerStats({
+@@ -424,13 +440,13 @@ export function ComposerStats({
                <button
                  type="button"
                  aria-label="Context usage details"
@@ -383,7 +373,7 @@ index 025f57253..53b81a83a 100644
                    {Math.round(context.usedPercentage)}%
                  </span>
                ) : (
-@@ -444,7 +460,7 @@ export function ComposerStats({
+@@ -445,7 +461,7 @@ export function ComposerStats({
                  <h3 className="font-medium">Context usage</h3>
                  <span className="text-muted-foreground tabular-nums">
                    {context?.usedPercentage != null
@@ -392,7 +382,7 @@ index 025f57253..53b81a83a 100644
                      : "Not reported"}
                  </span>
                </div>
-@@ -456,11 +472,37 @@ export function ComposerStats({
+@@ -457,11 +473,37 @@ export function ComposerStats({
                    {context ? count(context.usedTokens) : "Not reported"}
                  </Detail>
                  <Detail label="Window size">{count(context?.maxTokens ?? undefined)}</Detail>
@@ -431,7 +421,7 @@ index 025f57253..53b81a83a 100644
                {compactions.length > 0 && (
                  <div className="space-y-1.5">
                    <p className="font-medium">Recent compactions</p>
-@@ -498,6 +540,19 @@ export function ComposerStats({
+@@ -499,6 +541,19 @@ export function ComposerStats({
                  Compactions count completed events in the loaded main-agent history for this
                  provider session.
                </p>
@@ -452,10 +442,10 @@ index 025f57253..53b81a83a 100644
                  <p className="text-muted-foreground">
                    Reported{" "}
 diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
-index 2847b23ca..d32601f98 100644
+index 7d49d24a73f..5c64163cfe0 100644
 --- a/apps/web/src/lib/contextWindow.test.ts
 +++ b/apps/web/src/lib/contextWindow.test.ts
-@@ -8,7 +8,7 @@ import {
+@@ -21,7 +21,7 @@ const decodeTokenUsage = Schema.decodeSync(OrchestrationV2ProviderTurnTokenUsage
  
  describe("V2 context window presentation", () => {
    it("uses retained compaction token data when available", () => {
@@ -464,7 +454,7 @@ index 2847b23ca..d32601f98 100644
        {
          item: {
            id: "compaction-1" as never,
-@@ -22,8 +22,8 @@ describe("V2 context window presentation", () => {
+@@ -35,8 +35,8 @@ describe("V2 context window presentation", () => {
            ordinal: 1,
            status: "completed",
            title: null,
@@ -475,7 +465,7 @@ index 2847b23ca..d32601f98 100644
            updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
            type: "compaction",
            driver: null,
-@@ -31,9 +31,19 @@ describe("V2 context window presentation", () => {
+@@ -44,9 +44,19 @@ describe("V2 context window presentation", () => {
            afterTokenCount: 2_000,
          },
        },
@@ -495,10 +485,10 @@ index 2847b23ca..d32601f98 100644
 +    expect(snapshot?.totalProcessedTokens).toBeNull();
 +    expect(snapshot?.compactsAutomatically).toBeNull();
    });
+ });
  
-   it("prefers current provider usage and preserves ACP cost", () => {
-@@ -110,3 +120,39 @@ describe("latestProviderTurnTokenUsage", () => {
-     expect(latest?.usedTokens).toBe(300_000);
+@@ -207,3 +217,39 @@ describe("latestProviderTurnTokenUsage", () => {
+     }
    });
  });
 +
@@ -537,22 +527,23 @@ index 2847b23ca..d32601f98 100644
 +    ).toMatchObject({ compactsAutomatically: null, autoCompactThreshold: null });
 +  });
 +});
-diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
-index 33f59c3ea..1eca0df91 100644
---- a/apps/web/src/lib/contextWindow.ts
-+++ b/apps/web/src/lib/contextWindow.ts
-@@ -74,8 +74,8 @@ export function deriveLatestContextWindowSnapshot(
+diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
+index 66c48807465..b26504d8e96 100644
+--- a/packages/client-runtime/src/state/contextWindow.ts
++++ b/packages/client-runtime/src/state/contextWindow.ts
+@@ -105,8 +105,9 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
 -      compactsAutomatically: true,
--      autoCompactThreshold: null,
+-      autoCompactThreshold: liveUsage.autoCompactThreshold ?? null,
 +      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
-+      autoCompactThreshold: providerThread?.contextUsage?.autoCompactThreshold ?? null,
++      autoCompactThreshold:
++        liveUsage.autoCompactThreshold ?? providerThread?.contextUsage?.autoCompactThreshold ?? null,
        cost: null,
        updatedAt: liveUsage.updatedAt,
      };
-@@ -117,7 +117,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -148,7 +149,7 @@ export function deriveLatestContextWindowSnapshot(
    }
    for (let index = entries.length - 1; index >= 0; index -= 1) {
      const entry = entries[index];
@@ -561,7 +552,7 @@ index 33f59c3ea..1eca0df91 100644
        continue;
      }
      const payload = entry.item;
-@@ -135,7 +135,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -166,7 +167,7 @@ export function deriveLatestContextWindowSnapshot(
  
      return {
        usedTokens,
@@ -570,7 +561,7 @@ index 33f59c3ea..1eca0df91 100644
        maxTokens,
        remainingTokens,
        usedPercentage,
-@@ -151,10 +151,10 @@ export function deriveLatestContextWindowSnapshot(
+@@ -182,10 +183,10 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,

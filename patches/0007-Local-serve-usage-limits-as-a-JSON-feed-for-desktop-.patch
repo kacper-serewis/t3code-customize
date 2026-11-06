@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 09:21:12 +0200
-Subject: [PATCH 7/7] Local: serve usage limits as a JSON feed for desktop
+Subject: [PATCH 07/11] Local: serve usage limits as a JSON feed for desktop
  widgets
 
 GET /api/usage-limits returns every enabled subscription's session and
@@ -17,10 +17,10 @@ widget such as Dockset can poll it. Requests need the bearer token kept in
  create mode 100644 apps/server/src/usage/usageLimitsHttp.ts
 
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 3c1539a70..a83202081 100644
+index 5c9ab9c433f..cf3963f96f5 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -88,6 +88,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
+@@ -113,6 +113,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
  import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
  import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
  import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
@@ -28,17 +28,17 @@ index 3c1539a70..a83202081 100644
  import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
  import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
  import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
-@@ -709,6 +710,7 @@ const layerMakeRoutes = Layer.mergeAll(
-     ServerHttp.layerOtlpTracesProxyRoute,
+@@ -779,6 +780,7 @@ const layerMakeRoutes = Layer.mergeAll(
      ServerHttp.layerAssetRoute,
      ServerHttp.layerAttachmentUploadRoute,
+     GuestHttp.layer,
 +    UsageLimitsHttp.layerUsageLimitsRoute,
      DeviceHubProxy.layer,
      ServerBrowserStream.routeLayer,
      ServerHttp.layerStaticAndDevRoute,
 diff --git a/apps/server/src/usage/usageLimitsHttp.test.ts b/apps/server/src/usage/usageLimitsHttp.test.ts
 new file mode 100644
-index 000000000..2678e5cd6
+index 00000000000..2678e5cd65f
 --- /dev/null
 +++ b/apps/server/src/usage/usageLimitsHttp.test.ts
 @@ -0,0 +1,147 @@
@@ -191,7 +191,7 @@ index 000000000..2678e5cd6
 +});
 diff --git a/apps/server/src/usage/usageLimitsHttp.ts b/apps/server/src/usage/usageLimitsHttp.ts
 new file mode 100644
-index 000000000..b29bdb2d5
+index 00000000000..b29bdb2d52b
 --- /dev/null
 +++ b/apps/server/src/usage/usageLimitsHttp.ts
 @@ -0,0 +1,153 @@

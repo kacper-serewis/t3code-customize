@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Fri, 6 Nov 2026 11:15:48 +0100
+Subject: [PATCH 11/11] Local: drag the window from empty sidebar space
+
+On desktop, the empty space below the thread list now moves the window, like
+the title bar. The thread list no longer stretches to fill the sidebar;
+an invisible filler takes the leftover height and carries the existing
+drag-region class. It shrinks to nothing once the list scrolls, so rows,
+hover, context menus and drag-and-drop reordering are untouched. Web and
+mobile are unchanged.
+---
+ apps/web/src/components/Sidebar.tsx | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index 1ed3065a92c..1836ff104d3 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -3201,7 +3201,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+           </SidebarGroup>
+         }
+       >
+-        <SidebarGroup className="flex-1" role="presentation">
++        <SidebarGroup role="presentation">
+           {isSearchingThreads ? (
+             threadSearchResults.length > 0 ? (
+               <TooltipProvider
+@@ -3640,6 +3640,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+             </div>
+           ) : null}
+         </SidebarGroup>
++        {isElectron ? <div aria-hidden className="drag-region min-h-0 flex-1" /> : null}
+       </SidebarContent>
+       <SidebarChromeFooter />
+     </>

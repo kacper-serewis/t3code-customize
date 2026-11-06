@@ -1,25 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:16:17 +0200
-Subject: [PATCH 6/7] Local: order the model picker by subscription usage and
+Subject: [PATCH 06/11] Local: order the model picker by subscription usage and
  show 5h/weekly limits
 
 ---
  apps/web/src/components/chat/ModelListRow.tsx |  27 ++++
- .../components/chat/ModelPickerContent.tsx    |  35 ++++-
- .../components/chat/ModelPickerSidebar.tsx    |  32 ++++-
+ .../components/chat/ModelPickerContent.tsx    |  19 ++-
+ .../components/chat/ModelPickerSidebar.tsx    |  30 +++-
  .../chat/ModelPickerUsage.logic.test.ts       | 101 ++++++++++++++
  .../components/chat/ModelPickerUsage.logic.ts | 130 ++++++++++++++++++
  .../chat/SubscriptionSwitch.logic.ts          |   6 +-
- 6 files changed, 319 insertions(+), 12 deletions(-)
+ 6 files changed, 307 insertions(+), 6 deletions(-)
  create mode 100644 apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
  create mode 100644 apps/web/src/components/chat/ModelPickerUsage.logic.ts
 
 diff --git a/apps/web/src/components/chat/ModelListRow.tsx b/apps/web/src/components/chat/ModelListRow.tsx
-index 7a15f1736..f3689bb3f 100644
+index 69da770f1f8..3838eed5d5a 100644
 --- a/apps/web/src/components/chat/ModelListRow.tsx
 +++ b/apps/web/src/components/chat/ModelListRow.tsx
-@@ -15,6 +15,30 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+@@ -10,6 +10,30 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import { cn } from "~/lib/utils";
  import { modelPickerModelKey } from "./modelPickerKeys";
  import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
@@ -50,28 +50,28 @@ index 7a15f1736..f3689bb3f 100644
  
  export const ModelListRow = memo(function ModelListRow(props: {
    index: number;
-@@ -30,6 +54,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
-    */
+@@ -20,6 +44,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
+   driverKind: ProviderDriverKind;
    providerDisplayName: string;
    providerAccentColor?: string | undefined;
-+  /** The subscription's 5h and weekly limits, shown beside the provider. */
++  /** The subscription's 5h and weekly limits, shown at the end of the row. */
 +  usage?: PickerSubscriptionUsage | undefined;
    acpRegistryAgentId?: string | undefined;
    acpRegistryIconUrl?: string | undefined;
    isFavorite: boolean;
-@@ -95,6 +121,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
-             <span className="truncate text-xs font-normal leading-snug text-muted-foreground/70">
-               {providerLabel}
-             </span>
-+            {props.usage ? <ModelRowUsage usage={props.usage} /> : null}
-           </div>
-         )}
+@@ -101,6 +127,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
        </div>
+ 
+       <div className="flex shrink-0 items-center gap-1.5">
++        {props.usage ? <ModelRowUsage usage={props.usage} /> : null}
+         <Tooltip>
+           <TooltipTrigger
+             render={
 diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
-index da5b0d74d..0039b8b35 100644
+index f040df764cd..ea00634a7c7 100644
 --- a/apps/web/src/components/chat/ModelPickerContent.tsx
 +++ b/apps/web/src/components/chat/ModelPickerContent.tsx
-@@ -52,6 +52,7 @@ import {
+@@ -64,6 +64,7 @@ import {
    type ProviderInstanceEntry,
  } from "../../providerInstances";
  import { providerModelKey, sortProviderModelItems } from "../../modelOrdering";
@@ -79,69 +79,51 @@ index da5b0d74d..0039b8b35 100644
  
  type ModelPickerItem = {
    slug: string;
-@@ -330,6 +331,20 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
-     () => new Map(instanceEntries.map((entry) => [entry.instanceId, entry])),
-     [instanceEntries],
-   );
+@@ -516,6 +517,17 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+   const canOpenProviderSetup = onOpenProviderSetup !== undefined;
+ 
+   const entryByInstanceId = new Map(instanceEntries.map((entry) => [entry.instanceId, entry]));
 +  // Subscriptions are ordered from "use now" to "do not use yet" by their usage limits.
 +  const [openedAtMs] = useState(() => Date.now());
-+  const usageByInstance = useMemo(
-+    () =>
-+      pickerUsageByInstance(
-+        instanceEntries.map((entry) => entry.snapshot),
-+        openedAtMs,
-+      ),
-+    [instanceEntries, openedAtMs],
++  const usageByInstance = pickerUsageByInstance(
++    instanceEntries.map((entry) => entry.snapshot),
++    openedAtMs,
 +  );
-+  const usageOrderedEntries = useMemo(
-+    () => sortByPickerUsage(instanceEntries, (entry) => entry.instanceId, usageByInstance),
-+    [instanceEntries, usageByInstance],
++  const usageOrderedEntries = sortByPickerUsage(
++    instanceEntries,
++    (entry) => entry.instanceId,
++    usageByInstance,
 +  );
-   const matchesLockedProvider = useCallback(
-     (entry: Pick<ProviderInstanceEntry, "driverKind" | "continuationGroupKey">): boolean => {
-       if (props.lockedProvider === null) return true;
-@@ -425,7 +440,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+   const matchesLockedProvider = (
+     entry: Pick<ProviderInstanceEntry, "driverKind" | "continuationGroupKey">,
+   ): boolean => {
+@@ -622,7 +634,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
      return disabled;
-   }, [instanceEntries, isLocked, matchesLockedProvider]);
-   const sidebarInstanceEntries = useMemo(() => {
+   })();
+   const sidebarInstanceEntries = (() => {
 -    const enabledEntries = instanceEntries.filter(isProviderInstancePickerVisible);
 +    const enabledEntries = usageOrderedEntries.filter(isProviderInstancePickerVisible);
      if (!isLocked) {
        return enabledEntries;
      }
-@@ -439,11 +454,11 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
-       }
-     }
+@@ -638,7 +650,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
      return [...available, ...disabled];
--  }, [instanceEntries, isLocked, matchesLockedProvider]);
-+  }, [isLocked, matchesLockedProvider, usageOrderedEntries]);
+   })();
    const showSidebar = !isSearching && sidebarInstanceEntries.length > 0;
-   const instanceOrder = useMemo(
--    () => instanceEntries.map((entry) => entry.instanceId),
--    [instanceEntries],
-+    () => usageOrderedEntries.map((entry) => entry.instanceId),
-+    [usageOrderedEntries],
-   );
+-  const instanceOrder = instanceEntries.map((entry) => entry.instanceId);
++  const instanceOrder = usageOrderedEntries.map((entry) => entry.instanceId);
  
-   // Filter models based on search query and selected instance
-@@ -757,8 +772,14 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
-     return mapping.size > 0 ? mapping : EMPTY_MODEL_JUMP_LABELS;
-   }, [keybindings, modelJumpCommandByKey, modelJumpShortcutContext]);
-   const modelListExtraData = useMemo(
--    () => ({ favoritesSet, modelJumpLabelByKey, activeModelKey, selectedModelKeySet }),
--    [favoritesSet, modelJumpLabelByKey, activeModelKey, selectedModelKeySet],
-+    () => ({
-+      favoritesSet,
-+      modelJumpLabelByKey,
-+      activeModelKey,
-+      selectedModelKeySet,
-+      usageByInstance,
-+    }),
-+    [favoritesSet, modelJumpLabelByKey, activeModelKey, selectedModelKeySet, usageByInstance],
-   );
+   const filteredModels = (() => {
+     let result = flatModels;
+@@ -775,6 +787,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+     modelJumpLabelByKey,
+     activeModelKey,
+     selectedModelKeySet,
++    usageByInstance,
+   };
  
-   useEffect(() => {
-@@ -850,6 +871,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+   const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+@@ -860,6 +873,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
              onSelectInstance={handleSelectInstance}
              onFocusSearch={focusSearchInput}
              instanceEntries={sidebarInstanceEntries}
@@ -149,37 +131,37 @@ index da5b0d74d..0039b8b35 100644
              showFavorites
              {...(selectableUnavailableInstanceIds ? { selectableUnavailableInstanceIds } : {})}
              {...(lockedDisabledInstanceIds
-@@ -1022,6 +1044,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
-                         driverKind={model.driverKind}
-                         providerDisplayName={model.instanceDisplayName}
-                         providerAccentColor={model.instanceAccentColor}
-+                        usage={usageByInstance.get(model.instanceId)}
-                         acpRegistryAgentId={model.acpRegistryAgentId}
-                         acpRegistryIconUrl={model.acpRegistryIconUrl}
-                         isFavorite={favoritesSet.has(
+@@ -1045,6 +1059,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+                     driverKind={model.driverKind}
+                     providerDisplayName={model.instanceDisplayName}
+                     providerAccentColor={model.instanceAccentColor}
++                    usage={usageByInstance.get(model.instanceId)}
+                     acpRegistryAgentId={model.acpRegistryAgentId}
+                     acpRegistryIconUrl={model.acpRegistryIconUrl}
+                     isFavorite={favoritesSet.has(providerModelKey(model.instanceId, model.slug))}
 diff --git a/apps/web/src/components/chat/ModelPickerSidebar.tsx b/apps/web/src/components/chat/ModelPickerSidebar.tsx
-index 6d4710205..fdaf78396 100644
+index c07b1f33c5f..5ffda677678 100644
 --- a/apps/web/src/components/chat/ModelPickerSidebar.tsx
 +++ b/apps/web/src/components/chat/ModelPickerSidebar.tsx
 @@ -3,6 +3,7 @@ import { type ProviderInstanceId } from "@t3tools/contracts";
  import { memo, useLayoutEffect, useRef, useState } from "react";
- import { SparklesIcon, StarIcon } from "lucide-react";
+ import { StarIcon } from "lucide-react";
  import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 +import { formatPickerUsageWindows, type PickerSubscriptionUsage } from "./ModelPickerUsage.logic";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import { cn } from "~/lib/utils";
  import {
-@@ -51,6 +52,8 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
-    * their own model list.
-    */
+@@ -34,6 +35,8 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
+   onSelectInstance: (instanceId: ProviderInstanceId | "favorites") => void;
+   onFocusSearch: () => void;
    instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
 +  /** 5h and weekly limits per instance, for the tooltip and the use-now/wait dot. */
 +  usageByInstance?: ReadonlyMap<ProviderInstanceId, PickerSubscriptionUsage>;
-   /** Render the favorites rail entry. Hidden for locked-provider instance switching. */
    showFavorites?: boolean;
-   /** Instance ids shown in the rail but unavailable for the current picker context. */
-@@ -160,13 +163,27 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
-             const showNewBadge = props.newBadgeInstanceIds?.has(entry.instanceId) ?? false;
+   disabledInstanceIds?: ReadonlySet<ProviderInstanceId>;
+   selectableUnavailableInstanceIds?: ReadonlySet<ProviderInstanceId>;
+@@ -134,11 +137,27 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
+             const isHovered = hoveredInstanceId === entry.instanceId;
              const showInstanceBadge = shouldShowInstanceBadge(entry, props.instanceEntries);
  
 +            const usage = props.usageByInstance?.get(entry.instanceId);
@@ -188,11 +170,9 @@ index 6d4710205..fdaf78396 100644
                ? describeUnavailableInstance(entry)
                : isContextDisabled
                  ? (props.getDisabledInstanceTooltip?.(entry) ?? entry.displayName)
--                : showNewBadge
--                  ? `${entry.displayName} — New`
--                  : entry.displayName;
+-                : entry.displayName;
 +                : [
-+                    showNewBadge ? `${entry.displayName} — New` : entry.displayName,
++                    entry.displayName,
 +                    usageText,
 +                    usage?.tier === "use-now"
 +                      ? `Use now: ${usage.reason}`
@@ -209,7 +189,7 @@ index 6d4710205..fdaf78396 100644
  
              const button = (
                <Toolbar.Button
-@@ -214,6 +231,15 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
+@@ -180,6 +199,15 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
                    }
                    {...(entry.accentColor ? { badgeClassName: "h-3 min-w-3 px-0.5 text-5xs" } : {})}
                  />
@@ -222,12 +202,12 @@ index 6d4710205..fdaf78396 100644
 +                    aria-hidden
 +                  />
 +                ) : null}
-                 {showNewBadge ? (
-                   <span className={NEW_BADGE_CLASS} aria-hidden>
-                     <SparklesIcon className="size-2" />
+               </Toolbar.Button>
+             );
+ 
 diff --git a/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts b/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
 new file mode 100644
-index 000000000..3bf776026
+index 00000000000..3bf77602627
 --- /dev/null
 +++ b/apps/web/src/components/chat/ModelPickerUsage.logic.test.ts
 @@ -0,0 +1,101 @@
@@ -334,7 +314,7 @@ index 000000000..3bf776026
 +});
 diff --git a/apps/web/src/components/chat/ModelPickerUsage.logic.ts b/apps/web/src/components/chat/ModelPickerUsage.logic.ts
 new file mode 100644
-index 000000000..3422ddaf5
+index 00000000000..3422ddaf51e
 --- /dev/null
 +++ b/apps/web/src/components/chat/ModelPickerUsage.logic.ts
 @@ -0,0 +1,130 @@
@@ -469,7 +449,7 @@ index 000000000..3422ddaf5
 +  return usage.windows.map((window) => `${window.shortLabel} ${window.percentText}`).join(" · ");
 +}
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
-index 6557fdbc0..ca93fe8bc 100644
+index 6557fdbc015..ca93fe8bcdc 100644
 --- a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -117,7 +117,7 @@ export function assessSubscription(
