@@ -524,11 +524,12 @@ def checks(env, log):
     if missing:
         raise NeedsFix('Test files listed in checks.json no longer exist (moved upstream?):\n' + '\n'.join('  ' + t for t in missing))
     step('Testing the patches...')
-    steps = [(['vp', 'test', 'run', *spec['tests']], 'The patch tests failed.')]
-    steps += [(['tsc', '--noEmit', '-p', p + '/tsconfig.json'], f'Typecheck failed in {p}.') for p in spec['typecheck']]
-    for args, message in steps:
-        if run(args, cwd=SOURCE, env=env, log=log, check=False).returncode:
-            raise NeedsFix(message + ' Command: ' + ' '.join(args))
+    steps = [(['vp', 'test', 'run', *spec['tests']], SOURCE, 'The patch tests failed.')]
+    # Upstream typechecks each package with the tsrs checker; there is no tsc.
+    steps += [(['effect-tsgo', 'tsrs', '--noEmit'], SOURCE / p, f'Typecheck failed in {p}.') for p in spec['typecheck']]
+    for args, cwd, message in steps:
+        if run(args, cwd=cwd, env=env, log=log, check=False).returncode:
+            raise NeedsFix(message + ' Command: ' + ' '.join(args) + f' (in {cwd})')
 
 
 def build_bundles(env, version, stock_root, config, log):
