@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:22:06 +0100
-Subject: [PATCH 08/11] Local: show a proxy's pooled limits in the thread
+Subject: [PATCH 08/12] Local: show a proxy's pooled limits in the thread
  details card
 
 A Claude instance that talks to a custom endpoint (a CLI proxy) cannot read
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 new file mode 100644
-index 00000000000..b14b2c8cb67
+index 0000000000..b14b2c8cb6
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 @@ -0,0 +1,164 @@
@@ -193,7 +193,7 @@ index 00000000000..b14b2c8cb67
 +});
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 new file mode 100644
-index 00000000000..7b3c5b1a417
+index 0000000000..7b3c5b1a41
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 @@ -0,0 +1,83 @@
@@ -281,7 +281,7 @@ index 00000000000..7b3c5b1a417
 +  return own && notice !== null ? { kind: "notice", notice } : null;
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index f3ee87e1b7f..4e40bb81931 100644
+index 0d6c012948..056893e4be 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 @@ -5,10 +5,9 @@ import type {
@@ -298,7 +298,7 @@ index f3ee87e1b7f..4e40bb81931 100644
  } from "@t3tools/shared/usageLimits";
 @@ -23,6 +22,7 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
- import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+ import { formatContextWindowCompactionMessage } from "./compaction.logic";
  import { ThreadDetailsSection } from "./ThreadDetailsSection";
 +import { resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
  

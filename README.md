@@ -73,7 +73,7 @@ t3code-customize uninstall   remove it, its launcher or login agents, builds and
 - **Bugs:** before reporting anything to T3 Code, run `t3code-customize off`, reopen and check it happens on stock too. Report customization problems here.
 - **Windows:** not supported yet. The patches are platform independent; only the packaging differs. Your agent can adapt it, and PRs are welcome.
 - **macOS:** opening T3 Code from the Dock or Finder starts it stock for a moment; the watcher quits it and reopens it with the customization. It relies on T3 Code allowing a startup hook (`--inspect-brk`); if a release turns that off, the build stops and says so.
-- **Files:** builds live in `~/.local/share/t3code-customize`, the source checkout and logs in `~/.cache/t3code-customize`.
+- **Files:** builds and the source checkout live in `~/.local/share/t3code-customize`, logs in `~/.cache/t3code-customize`.
 
 ## License
 

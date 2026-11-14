@@ -34,7 +34,9 @@ SHARE = Path(os.environ.get('XDG_DATA_HOME') or HOME / '.local/share')
 DATA = SHARE / NAME
 CACHE = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / NAME
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config') / NAME
-SOURCE = CACHE / 't3code'
+# Not under a .cache folder: upstream's test config excludes **/.cache/**, which would hide every test.
+SOURCE = DATA / 'source'
+OLD_SOURCE = CACHE / 't3code'
 STATE = DATA / 'state.json'
 CURRENT = DATA / 'current'
 DISABLED = DATA / 'disabled'
@@ -487,6 +489,10 @@ def has_commit(ref):
 
 
 def ensure_commit(commit, version, log):
+    if not (SOURCE / '.git').exists() and (OLD_SOURCE / '.git').exists():
+        # Earlier versions kept the checkout under the cache folder.
+        SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(OLD_SOURCE), SOURCE)
     if not (SOURCE / '.git').exists():
         step('Downloading T3 Code source history (one time)...')
         shutil.rmtree(SOURCE, ignore_errors=True)

@@ -10,13 +10,13 @@ is to carry them onto the user's nightly with every feature still working.
 
 1. Run `./t3code-customize build` from this repo. It finds the installed T3 Code (AppImage or macOS app),
    reads the exact upstream commit it was built from, and applies the patches to
-   that commit in the source checkout at `~/.cache/t3code-customize/t3code`.
+   that commit in the source checkout at `~/.local/share/t3code-customize/source`.
 2. If it reports a conflict, a rebase is stopped in that checkout. If it reports a
    failing test or typecheck, the commits are in place and the checks failed.
 
 ## Fix
 
-Work only in `~/.cache/t3code-customize/t3code` and this repo.
+Work only in `~/.local/share/t3code-customize/source` and this repo.
 
 - Conflicts: resolve each file, `git add` it, then `GIT_EDITOR=true git rebase --continue`.
   Keep upstream's change and port the patch on top of it. When upstream moved or split

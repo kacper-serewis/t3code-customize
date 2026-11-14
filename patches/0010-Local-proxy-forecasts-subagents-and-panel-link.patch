@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:50:43 +0100
-Subject: [PATCH 10/11] Local: proxy forecasts, subagents and panel link
+Subject: [PATCH 10/12] Local: proxy forecasts, subagents and panel link
 
 - Usage page, wide layout: each account segment carries its week sparkline
   and a "next" badge on the account the proxy gives the next new chat, which
@@ -32,10 +32,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 apps/web/src/lib/proxyRouting.test.ts
 
 diff --git a/apps/server/src/usage/UsageLimitSources.ts b/apps/server/src/usage/UsageLimitSources.ts
-index 3a2bd80a452..4e91decfe85 100644
+index 5b9785557a..692ccb180a 100644
 --- a/apps/server/src/usage/UsageLimitSources.ts
 +++ b/apps/server/src/usage/UsageLimitSources.ts
-@@ -40,11 +40,16 @@ export class UsageLimitSources extends Context.Service<
+@@ -42,11 +42,16 @@ export class UsageLimitSources extends Context.Service<
    }
  >()("t3/usage/UsageLimitSources") {}
  
@@ -53,7 +53,7 @@ index 3a2bd80a452..4e91decfe85 100644
    } catch {
      return fallback;
    }
-@@ -60,20 +65,41 @@ const OBSERVABILITY_INTERVAL = Duration.seconds(60);
+@@ -62,20 +67,41 @@ const OBSERVABILITY_INTERVAL = Duration.seconds(60);
  
  type Observability = Pick<UsageLimitSourceSnapshot, "routing" | "history" | "health">;
  
@@ -97,7 +97,7 @@ index 3a2bd80a452..4e91decfe85 100644
    observed.routing !== undefined || observed.history !== undefined || observed.health !== undefined;
  
  /** @public */
-@@ -115,9 +141,13 @@ export const make = Effect.gen(function* () {
+@@ -129,9 +155,13 @@ export const make = Effect.gen(function* () {
      else withoutObservability.add(id);
      if (accounts._tag === "Failure") {
        yield* Effect.logDebug("usage limit source read failed", { id, cause: accounts.failure });
@@ -113,7 +113,7 @@ index 3a2bd80a452..4e91decfe85 100644
    });
  
    const publish = Effect.fn("UsageLimitSources.publish")(function* (
-@@ -162,7 +192,7 @@ export const make = Effect.gen(function* () {
+@@ -176,7 +206,7 @@ export const make = Effect.gen(function* () {
            const managementKey = yield* readManagementKey(config);
            if (managementKey.length === 0) return snapshot;
            const observed = yield* api.readObservability({ url: config.url, managementKey });
@@ -123,7 +123,7 @@ index 3a2bd80a452..4e91decfe85 100644
        { concurrency: 4 },
      );
 diff --git a/apps/server/src/usage/cliproxyObservability.test.ts b/apps/server/src/usage/cliproxyObservability.test.ts
-index ae9b8d6416e..83aed788234 100644
+index ae9b8d6416..83aed78823 100644
 --- a/apps/server/src/usage/cliproxyObservability.test.ts
 +++ b/apps/server/src/usage/cliproxyObservability.test.ts
 @@ -20,8 +20,9 @@ describe("toRouting", () => {
@@ -170,7 +170,7 @@ index ae9b8d6416e..83aed788234 100644
                    inactive: false,
                  },
 diff --git a/apps/server/src/usage/cliproxyObservability.ts b/apps/server/src/usage/cliproxyObservability.ts
-index b98a2b1cb2c..60098146968 100644
+index b98a2b1cb2..6009814696 100644
 --- a/apps/server/src/usage/cliproxyObservability.ts
 +++ b/apps/server/src/usage/cliproxyObservability.ts
 @@ -52,6 +52,7 @@ function adaptiveWindow(value: unknown): UsageLimitSourceAdaptiveWindow | undefi
@@ -240,7 +240,7 @@ index b98a2b1cb2c..60098146968 100644
      ];
    });
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index fec7dee3d29..61527407bab 100644
+index 04527239b8..34c470be54 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 @@ -26,6 +26,9 @@ import {
@@ -359,7 +359,7 @@ index fec7dee3d29..61527407bab 100644
  function PooledLimitRow({
    window,
 diff --git a/apps/web/src/components/usage/UsageLimitsPooled.tsx b/apps/web/src/components/usage/UsageLimitsPooled.tsx
-index bf85f73ed43..a760872e476 100644
+index 52951fe1c7..4b5d1c791f 100644
 --- a/apps/web/src/components/usage/UsageLimitsPooled.tsx
 +++ b/apps/web/src/components/usage/UsageLimitsPooled.tsx
 @@ -6,6 +6,7 @@ import {
@@ -370,10 +370,10 @@ index bf85f73ed43..a760872e476 100644
    formatResetsIn,
    type LimitAccount,
    type LimitPool,
-@@ -47,14 +48,26 @@ import {
-   resetCreditsSummary,
-   useResetCredit,
- } from "./UsageLimits";
+@@ -42,14 +43,26 @@ import { OpenAI } from "../Icons";
+ import { Alert, AlertTitle } from "../ui/alert";
+ import { Popover, PopoverCreateHandle, PopoverPopup, PopoverTrigger } from "../ui/popover";
+ import { PaceIcon, ResetCreditDialog, barColor, usePaceMark, useResetCredit } from "./UsageLimits";
 -import { describeAdaptiveWindow } from "../../lib/proxyRouting";
 +import { describeAdaptiveWindow, projectRunOut } from "../../lib/proxyRouting";
  import {
@@ -398,7 +398,7 @@ index bf85f73ed43..a760872e476 100644
  import { UsageSparkline, UsageSparklineMini } from "./UsageSparkline";
  
  /** Routing and history a proxy fork reports, keyed by pooled account key. */
-@@ -247,6 +260,7 @@ function ProxyAccountDetails({
+@@ -248,6 +261,7 @@ function ProxyAccountDetails({
    const history = windowHistory(observed, window);
    const adaptive = windowAdaptive(observed, window);
    const spare = describeAdaptiveWindow("Spare", adaptive)?.replace("Spare: ", "");
@@ -406,7 +406,7 @@ index bf85f73ed43..a760872e476 100644
    if (history.length < 2 && !spare && !observed.isNext) return null;
    return (
      <div className="flex flex-col gap-2 border-t border-border/60 pt-2.5">
-@@ -257,6 +271,17 @@ function ProxyAccountDetails({
+@@ -258,6 +272,17 @@ function ProxyAccountDetails({
          formatAt={(at) => formatUpcomingTimestamp(new Date(at).toISOString(), timestampFormat, now)}
        />
        {spare ? <Row label="Proxy">{spare}</Row> : null}
@@ -424,7 +424,7 @@ index bf85f73ed43..a760872e476 100644
        {observed.isNext ? <Row label="Routing">Gets the next new chat</Row> : null}
      </div>
    );
-@@ -388,6 +413,7 @@ function SegmentTriggers({
+@@ -390,6 +415,7 @@ function SegmentTriggers({
    readonly showAccountName: boolean;
  }) {
    const popover = use(SegmentPopoverContext) ?? undefined;
@@ -432,7 +432,7 @@ index bf85f73ed43..a760872e476 100644
    const payload: SegmentPayload = { account, window, reset, redeem };
    const remaining = remainingPercent(window);
    const timeLeft = paceRemainingPercent(window, now);
-@@ -456,6 +482,8 @@ function SegmentTriggers({
+@@ -458,6 +484,8 @@ function SegmentTriggers({
                {remaining}%
              </span>
            ) : null}
@@ -441,7 +441,7 @@ index bf85f73ed43..a760872e476 100644
            {resetsIn || credits ? (
              <span className="ms-auto flex min-w-0 items-center gap-1.5 overflow-hidden rounded-sm bg-background/85 px-1.5 py-0.5 text-2xs whitespace-nowrap text-foreground tabular-nums">
                {resetsIn?.replace("resets in ", "↻ ") ?? ""}
-@@ -518,6 +546,7 @@ function LegendRow({
+@@ -520,6 +548,7 @@ function LegendRow({
        <AccountName account={account} className="min-w-0 truncate font-medium text-foreground" />
        <span className="shrink-0 font-semibold text-foreground tabular-nums">{remaining}%</span>
        <UsageSparklineMini points={windowHistory(observed, window)} now={now} className="ms-2" />
@@ -449,7 +449,7 @@ index bf85f73ed43..a760872e476 100644
        <span className="ms-auto flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground tabular-nums">
          {resetsIn?.replace("resets in ", "↻ ") ?? ""}
          {credits ? (
-@@ -664,8 +693,10 @@ export function UsageLimitsPooled({
+@@ -679,8 +708,10 @@ export function UsageLimitsPooled({
    const pools = collectLimitPools(collectLimitAccounts(presentations), now);
    const notices = [
      ...collectLimitNotices(presentations),
@@ -459,8 +459,8 @@ index bf85f73ed43..a760872e476 100644
 +  const proxyPanels = collectProxyPanels(presentations);
    const proxyObservability = collectProxyObservability(presentations);
    const externalLinks = collectExternalUsageLinks(presentations);
-   const cursorPromptAt =
-@@ -737,6 +768,27 @@ export function UsageLimitsPooled({
+   return (
+@@ -745,6 +776,27 @@ export function UsageLimitsPooled({
            </Button>
          </section>
        ))}
@@ -489,7 +489,7 @@ index bf85f73ed43..a760872e476 100644
      </div>
    );
 diff --git a/apps/web/src/components/usage/proxyObservability.test.ts b/apps/web/src/components/usage/proxyObservability.test.ts
-index 219eb9b8901..eaf7089fdae 100644
+index 219eb9b890..eaf7089fda 100644
 --- a/apps/web/src/components/usage/proxyObservability.test.ts
 +++ b/apps/web/src/components/usage/proxyObservability.test.ts
 @@ -9,8 +9,11 @@ import type { LimitPresentations } from "@t3tools/shared/usageLimits";
@@ -569,7 +569,7 @@ index 219eb9b8901..eaf7089fdae 100644
 +  });
 +});
 diff --git a/apps/web/src/components/usage/proxyObservability.ts b/apps/web/src/components/usage/proxyObservability.ts
-index 933eed342f9..646df0fa613 100644
+index 933eed342f..646df0fa61 100644
 --- a/apps/web/src/components/usage/proxyObservability.ts
 +++ b/apps/web/src/components/usage/proxyObservability.ts
 @@ -4,7 +4,9 @@ import type {
@@ -639,7 +639,7 @@ index 933eed342f9..646df0fa613 100644
 +}
 diff --git a/apps/web/src/lib/proxyRouting.test.ts b/apps/web/src/lib/proxyRouting.test.ts
 new file mode 100644
-index 00000000000..9147db8c273
+index 0000000000..9147db8c27
 --- /dev/null
 +++ b/apps/web/src/lib/proxyRouting.test.ts
 @@ -0,0 +1,119 @@
@@ -763,7 +763,7 @@ index 00000000000..9147db8c273
 +  });
 +});
 diff --git a/apps/web/src/lib/proxyRouting.ts b/apps/web/src/lib/proxyRouting.ts
-index 230ea8e93ee..f957f4dbaae 100644
+index 230ea8e93e..f957f4dbaa 100644
 --- a/apps/web/src/lib/proxyRouting.ts
 +++ b/apps/web/src/lib/proxyRouting.ts
 @@ -111,3 +111,56 @@ export function describeAdaptiveWindow(
@@ -824,10 +824,10 @@ index 230ea8e93ee..f957f4dbaae 100644
 +  return undefined;
 +}
 diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
-index 09cbe6dd1d3..02d721b5d76 100644
+index 4580ef9c1c..2dfd2adb27 100644
 --- a/packages/contracts/src/providerUsageLimits.ts
 +++ b/packages/contracts/src/providerUsageLimits.ts
-@@ -90,6 +90,16 @@ export const UsageLimitSourceRoutingSession = Schema.Struct({
+@@ -107,6 +107,16 @@ export const UsageLimitSourceRoutingSession = Schema.Struct({
    switches: Schema.Array(
      Schema.Struct({ at: IsoDateTime, from: Schema.String, to: Schema.String }),
    ),
@@ -844,7 +844,7 @@ index 09cbe6dd1d3..02d721b5d76 100644
  });
  export type UsageLimitSourceRoutingSession = typeof UsageLimitSourceRoutingSession.Type;
  
-@@ -100,6 +110,8 @@ export const UsageLimitSourceAdaptiveWindow = Schema.Struct({
+@@ -117,6 +127,8 @@ export const UsageLimitSourceAdaptiveWindow = Schema.Struct({
    reserve: Schema.Number,
    spare: Schema.Number,
    forecast: Schema.Number,
@@ -853,7 +853,7 @@ index 09cbe6dd1d3..02d721b5d76 100644
    learning: Schema.Boolean,
    inactive: Schema.Boolean,
  });
-@@ -178,6 +190,8 @@ export const UsageLimitSourceSnapshot = Schema.Struct({
+@@ -199,6 +211,8 @@ export const UsageLimitSourceSnapshot = Schema.Struct({
    routing: Schema.optional(UsageLimitSourceRouting),
    history: Schema.optional(UsageLimitSourceHistory),
    health: Schema.optional(UsageLimitSourceHealth),

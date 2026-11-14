@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sat, 14 Nov 2026 13:45:35 +0100
+Subject: [PATCH 12/12] Local: let theme CSS name images in the themes
+ directory
+
+Theme CSS may hold 20,000 characters, so an embedded background image has
+to stay near 10 KB and looks blurred at window size. A theme can now name an
+image file instead: url(theme-file:NAME) points at an avif, webp, png, jpg or
+gif of up to 4 MB that sits next to the theme files.
+
+The server reads the image through the same guarded read as theme files and
+serves the theme with it inlined as a data: address, so clients still load
+nothing by address and their check is unchanged. Served CSS gets its own,
+larger length limit. Reading a theme back returns the file as written, and
+the web client no longer stores CSS that large for its boot paint.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ apps/server/src/environmentTheme.test.ts | 28 ++++++++
+ apps/server/src/environmentTheme.ts      | 91 +++++++++++++++++++++---
+ apps/web/src/themePalette.ts             |  9 ++-
+ packages/contracts/src/server.ts         |  6 ++
+ packages/shared/src/themeCss.test.ts     | 51 ++++++++++++-
+ packages/shared/src/themeCss.ts          | 41 ++++++++++-
+ 6 files changed, 213 insertions(+), 13 deletions(-)
+
+diff --git a/apps/server/src/environmentTheme.test.ts b/apps/server/src/environmentTheme.test.ts
+index 1e8b538a66..c6cce2e7e4 100644
+--- a/apps/server/src/environmentTheme.test.ts
++++ b/apps/server/src/environmentTheme.test.ts
+@@ -294,6 +294,34 @@ it.layer(NodeServices.layer)("environment theme", (it) => {
+     );
+   });
+ 
++  it.effect("serves a named image inlined and reads the theme back as written", () =>
++    withEnvironmentThemes(
++      {},
++      Effect.gen(function* () {
++        const fs = yield* FileSystem.FileSystem;
++        const path = yield* Path.Path;
++        const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
++        yield* fs.writeFile(path.join(environmentThemesDir, "wall.png"), new Uint8Array([1, 2, 3]));
++        yield* fs.writeFileString(path.join(environmentThemesDir, "notes.txt"), "not an image");
++        const themes = yield* EnvironmentTheme.EnvironmentThemeService;
++        const css =
++          "body { background: url(theme-file:wall.png), url(theme-file:gone.png), url(theme-file:notes.txt); }";
++        yield* themes.apply({ themeId: "walled", theme: { ...NIGHTFALL_THEME, css } });
++
++        assert.deepEqual(yield* themes.current, [
++          {
++            id: "walled",
++            ...NIGHTFALL_THEME,
++            css: 'body { background: url("data:image/png;base64,AQID"), url("data:,"), url("data:,"); }',
++          },
++        ]);
++        // Reading without inlining, as `read` does, gives the file as written, not megabytes of base64.
++        const written = yield* EnvironmentTheme.readPublishedThemes(environmentThemesDir);
++        assert.equal(written[0]?.css, css);
++      }),
++    ),
++  );
++
+   it.effect("keeps the served theme when an update does not fit the size limit", () => {
+     const large = (name: string): EnvironmentThemeFile => ({
+       ...NIGHTFALL_THEME,
+diff --git a/apps/server/src/environmentTheme.ts b/apps/server/src/environmentTheme.ts
+index b658870f2e..4a081f5ce9 100644
+--- a/apps/server/src/environmentTheme.ts
++++ b/apps/server/src/environmentTheme.ts
+@@ -11,7 +11,11 @@ import {
+   environmentThemeFileHasColors,
+ } from "@t3tools/contracts";
+ import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
+-import { themeCssLoadsRemoteFiles } from "@t3tools/shared/themeCss";
++import {
++  inlineThemeFiles,
++  themeCssLoadsRemoteFiles,
++  themeFileMediaType,
++} from "@t3tools/shared/themeCss";
+ import { BUILT_IN_THEME_IDS, UNPUBLISHABLE_THEME_IDS } from "@t3tools/shared/themePalettes";
+ import * as Cause from "effect/Cause";
+ import * as Context from "effect/Context";
+@@ -47,6 +51,12 @@ const MAX_THEME_FILES = 32;
+ /** Shared with publishing so it cannot accept files the watcher skips. */
+ export const MAX_THEME_FILE_BYTES = 32 * 1024;
+ const MAX_THEME_TOTAL_BYTES = 192 * 1024;
++/** One image that theme CSS names with `url(theme-file:NAME)`. */
++const MAX_THEME_IMAGE_BYTES = 4 * 1024 * 1024;
++/** Keeps one theme's served CSS, with its images as base64, under THEME_SERVED_CSS_MAX_LENGTH. */
++const MAX_THEME_IMAGES_BYTES_PER_THEME = 8 * 1024 * 1024;
++/** Every image inlined in one read of the directory. */
++const MAX_THEME_IMAGES_TOTAL_BYTES = 32 * 1024 * 1024;
+ 
+ interface PublishedThemes {
+   readonly seq: number;
+@@ -135,7 +145,7 @@ const pathIsTaken = (filePath: string): boolean => {
+ 
+ /** Validates and reads one handle; rejects symlinked files, allows symlinked directories.
+  * Uses non-blocking opens against FIFOs; Windows lacks these flags and checks symlinks with lstat. */
+-export const readThemeFileGuarded = (filePath: string, maxBytes: number): string | null => {
++const readThemeFileBytesGuarded = (filePath: string, maxBytes: number): Buffer | null => {
+   let fd: number;
+   try {
+     if (NodeFS.constants.O_NOFOLLOW === undefined && NodeFS.lstatSync(filePath).isSymbolicLink()) {
+@@ -160,8 +170,7 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
+       if (read <= 0) break;
+       offset += read;
+     }
+-    // Unlike Buffer#toString, TextDecoder drops a UTF-8 BOM, which JSON.parse rejects.
+-    return new TextDecoder().decode(contents.subarray(0, offset));
++    return contents.subarray(0, offset);
+   } catch {
+     return null;
+   } finally {
+@@ -169,7 +178,21 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
+   }
+ };
+ 
+-export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
++/** The same guarded read, as text. */
++export const readThemeFileGuarded = (filePath: string, maxBytes: number): string | null => {
++  const contents = readThemeFileBytesGuarded(filePath, maxBytes);
++  // Unlike Buffer#toString, TextDecoder drops a UTF-8 BOM, which JSON.parse rejects.
++  return contents === null ? null : new TextDecoder().decode(contents);
++};
++
++/**
++ * With `inlineImages`, each `url(theme-file:NAME)` in a theme's CSS becomes the data: address of
++ * that image in the directory, which is how clients are served. Without it, the CSS is as written.
++ */
++export const readPublishedThemes = Effect.fn(function* (
++  themesDir: string,
++  options: { readonly inlineImages?: boolean } = {},
++) {
+   const fs = yield* FileSystem.FileSystem;
+   const entries = yield* fs
+     .readDirectory(themesDir)
+@@ -178,6 +201,43 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+   const themes: Array<EnvironmentTheme> = [];
+   let examined = 0;
+   let totalBytes = 0;
++
++  // Themes may share an image, so each is read once per pass.
++  const images = new Map<string, { readonly url: string; readonly bytes: number } | undefined>();
++  const skippedImages = new Set<string>();
++  let imageBytes = 0;
++  const loadImage = (name: string) => {
++    if (images.has(name)) return images.get(name);
++    const mediaType = themeFileMediaType(name);
++    // The name pattern has no path separator, so this stays inside the directory.
++    const contents =
++      mediaType === undefined
++        ? null
++        : readThemeFileBytesGuarded(`${themesDir}/${name}`, MAX_THEME_IMAGE_BYTES);
++    const image =
++      mediaType === undefined ||
++      contents === null ||
++      imageBytes + contents.length > MAX_THEME_IMAGES_TOTAL_BYTES
++        ? undefined
++        : { url: `data:${mediaType};base64,${contents.toString("base64")}`, bytes: contents.length };
++    if (image === undefined) skippedImages.add(name);
++    else imageBytes += image.bytes;
++    images.set(name, image);
++    return image;
++  };
++  const inlineImages = (css: string): string => {
++    let themeBytes = 0;
++    return inlineThemeFiles(css, (name) => {
++      const image = loadImage(name);
++      if (image === undefined) return undefined;
++      if (themeBytes + image.bytes > MAX_THEME_IMAGES_BYTES_PER_THEME) {
++        skippedImages.add(name);
++        return undefined;
++      }
++      themeBytes += image.bytes;
++      return image.url;
++    });
++  };
+   for (const entry of entries.toSorted()) {
+     if (!entry.endsWith(THEME_FILE_SUFFIX)) continue;
+     const id = entry.slice(0, -THEME_FILE_SUFFIX.length);
+@@ -228,7 +288,18 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+       break;
+     }
+ 
+-    themes.push({ id, ...file });
++    themes.push({
++      id,
++      ...file,
++      ...(options.inlineImages && file.css !== undefined ? { css: inlineImages(file.css) } : {}),
++    });
++  }
++  if (skippedImages.size > 0) {
++    yield* Effect.logWarning("ignoring unusable environment theme images", {
++      path: themesDir,
++      images: [...skippedImages].toSorted(),
++      limit: MAX_THEME_IMAGE_BYTES,
++    });
+   }
+   return themes;
+ });
+@@ -247,7 +318,7 @@ const make = Effect.gen(function* () {
+ 
+   const refresh = refreshSemaphore.withPermits(1)(
+     Effect.gen(function* () {
+-      const themes = yield* readPublishedThemes(environmentThemesDir).pipe(
++      const themes = yield* readPublishedThemes(environmentThemesDir, { inlineImages: true }).pipe(
+         Effect.provideService(FileSystem.FileSystem, fs),
+       );
+       // Compare the whole value so new fields cannot silently miss republishes.
+@@ -411,7 +482,11 @@ const make = Effect.gen(function* () {
+         known: themes.map(({ id }) => id),
+       });
+     }
+-    return { current: defaultTheme, themes, theme };
++    // The served copy has its images inlined. Whoever reads a theme gets the file as written.
++    const written = (yield* readPublishedThemes(environmentThemesDir).pipe(
++      Effect.provideService(FileSystem.FileSystem, fs),
++    )).find((candidate) => candidate.id === themeId);
++    return { current: defaultTheme, themes, theme: written ?? theme };
+   });
+ 
+   return {
+diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
+index a6bea8fb86..730536ae08 100644
+--- a/apps/web/src/themePalette.ts
++++ b/apps/web/src/themePalette.ts
+@@ -355,8 +355,15 @@ export const environmentThemeDefinitionsAtom = Atom.make((get) => {
+ 
+ export function storePublishedEnvironmentThemes(definitions: ReadonlyArray<ThemeDefinition>) {
+   if (appAtomRegistry.get(publishedThemesAtom) === null) return;
++  // CSS with inlined images would fill the storage quota and is dropped on read anyway.
++  // Boot paints the theme's colors and the images follow on connect.
++  const storable = definitions.map((definition) => {
++    if (definition.css === undefined || isThemeCss(definition.css)) return definition;
++    const { css: _css, ...withoutCss } = definition;
++    return withoutCss;
++  });
+   try {
+-    window.localStorage.setItem(ENVIRONMENT_THEMES_STORAGE_KEY, JSON.stringify(definitions));
++    window.localStorage.setItem(ENVIRONMENT_THEMES_STORAGE_KEY, JSON.stringify(storable));
+   } catch {
+     // Without the stored copy the next launch paints stock colors until connect.
+   }
+diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
+index 88fa0220fe..3c2ddec2e6 100644
+--- a/packages/contracts/src/server.ts
++++ b/packages/contracts/src/server.ts
+@@ -623,6 +623,11 @@ const EnvironmentThemeColors = Schema.Record(
+ );
+ 
+ export const THEME_CSS_MAX_LENGTH = 20_000;
++/**
++ * Served CSS can be far longer than a theme file's: the server replaces each
++ * `url(theme-file:NAME)` with the image of that name from the themes directory.
++ */
++export const THEME_SERVED_CSS_MAX_LENGTH = 16_000_000;
+ 
+ const environmentThemeFields = {
+   version: Schema.optional(Schema.Literal(1)),
+@@ -648,6 +653,7 @@ export type EnvironmentThemeFile = typeof EnvironmentThemeFile.Type;
+ export const EnvironmentTheme = Schema.Struct({
+   id: EnvironmentThemeId,
+   ...environmentThemeFields,
++  css: Schema.optional(Schema.String.check(Schema.isMaxLength(THEME_SERVED_CSS_MAX_LENGTH))),
+ });
+ export type EnvironmentTheme = typeof EnvironmentTheme.Type;
+ 
+diff --git a/packages/shared/src/themeCss.test.ts b/packages/shared/src/themeCss.test.ts
+index e3a4f1efeb..f4fde32c2e 100644
+--- a/packages/shared/src/themeCss.test.ts
++++ b/packages/shared/src/themeCss.test.ts
+@@ -1,6 +1,11 @@
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { themeCssValueFetches } from "./themeCss.ts";
++import {
++  inlineThemeFiles,
++  themeCssLoadsRemoteFiles,
++  themeCssValueFetches,
++  themeFileMediaType,
++} from "./themeCss.ts";
+ 
+ describe("themeCssValueFetches", () => {
+   it.each([
+@@ -21,3 +26,47 @@ describe("themeCssValueFetches", () => {
+     expect(themeCssValueFetches(value)).toBe(fetches);
+   });
+ });
++
++describe("theme files", () => {
++  it("lets published CSS name an image in the themes directory", () => {
++    expect(themeCssLoadsRemoteFiles("body { background: url(theme-file:wall.avif); }")).toBe(false);
++    expect(themeCssLoadsRemoteFiles(`body { background: url( "theme-file:wall-2.png" ); }`)).toBe(
++      false,
++    );
++  });
++
++  it("still refuses a path, a mismatched quote, and a remote address beside it", () => {
++    expect(themeCssLoadsRemoteFiles("body { background: url(theme-file:../wall.avif); }")).toBe(
++      true,
++    );
++    expect(themeCssLoadsRemoteFiles("body { background: url(theme-file:a/wall.avif); }")).toBe(
++      true,
++    );
++    expect(themeCssLoadsRemoteFiles(`body { background: url("theme-file:wall.avif'); }`)).toBe(
++      true,
++    );
++    expect(
++      themeCssLoadsRemoteFiles(
++        "body { background: url(theme-file:wall.avif), url(https://example.com/a); }",
++      ),
++    ).toBe(true);
++  });
++
++  it("is never loaded by a client that sees the name", () => {
++    expect(themeCssValueFetches("url(theme-file:wall.avif)")).toBe(true);
++  });
++
++  it("inlines what the loader gives and empties the rest", () => {
++    const css = `a { background: url(theme-file:wall.avif), url('theme-file:gone.png'); }`;
++    expect(
++      inlineThemeFiles(css, (name) => (name === "wall.avif" ? "data:image/avif;base64,AA" : undefined)),
++    ).toBe(`a { background: url("data:image/avif;base64,AA"), url("data:,"); }`);
++  });
++
++  it("knows which files are images", () => {
++    expect(themeFileMediaType("wall.avif")).toBe("image/avif");
++    expect(themeFileMediaType("WALL.JPG")).toBe("image/jpeg");
++    expect(themeFileMediaType("notes.txt")).toBeUndefined();
++    expect(themeFileMediaType("wall")).toBeUndefined();
++  });
++});
+diff --git a/packages/shared/src/themeCss.ts b/packages/shared/src/themeCss.ts
+index 48b1259d03..9f243385b8 100644
+--- a/packages/shared/src/themeCss.ts
++++ b/packages/shared/src/themeCss.ts
+@@ -4,6 +4,39 @@ const FETCHES_BY_STRING = /image-set\(|\bsrc\(/i;
+ // Only CSS whitespace may come first. \s also matches U+00A0, which makes the address relative.
+ const URL_NOT_LOCAL = /url\((?![ \t\n\f\r]*["']?(?:data:|#))/i;
+ 
++/** `url(theme-file:NAME)` names an image in the themes directory. The server inlines it. */
++const THEME_FILE_URL =
++  /url\([ \t\n\f\r]*(["']?)theme-file:([A-Za-z0-9][A-Za-z0-9._-]{0,63})\1[ \t\n\f\r]*\)/g;
++
++const THEME_FILE_MEDIA_TYPES: Readonly<Record<string, string>> = {
++  avif: "image/avif",
++  webp: "image/webp",
++  png: "image/png",
++  jpg: "image/jpeg",
++  jpeg: "image/jpeg",
++  gif: "image/gif",
++};
++
++/** The media type a theme file is served as, or undefined when it is not an image. */
++export function themeFileMediaType(name: string): string | undefined {
++  const dot = name.lastIndexOf(".");
++  return dot < 0 ? undefined : THEME_FILE_MEDIA_TYPES[name.slice(dot + 1).toLowerCase()];
++}
++
++/**
++ * Replaces each `url(theme-file:NAME)` with the data: address `load` gives for that name.
++ * A name it gives nothing for becomes an empty data: address, so no client fetches it.
++ */
++export function inlineThemeFiles(
++  css: string,
++  load: (name: string) => string | undefined,
++): string {
++  return css.replace(
++    THEME_FILE_URL,
++    (_match, _quote: string, name: string) => `url("${load(name) ?? "data:,"}")`,
++  );
++}
++
+ /**
+  * Whether one declaration value can load a remote file. Clients drop those declarations.
+  * A value with var() stays unparsed until use, and an escape can spell `var` or `url` in it,
+@@ -15,7 +48,8 @@ export function themeCssValueFetches(value: string): boolean {
+ 
+ /** A text check for early feedback. CSS escapes can dodge it; the client check is the guard. */
+ export function themeCssLoadsRemoteFiles(css: string): boolean {
+-  const code = css.replace(/\/\*[\s\S]*?\*\//g, "");
++  // The server swaps a theme file for a data: address before any client sees the CSS.
++  const code = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(THEME_FILE_URL, "url(#theme-file)");
+   return /@import/i.test(code) || FETCHES_BY_STRING.test(code) || URL_NOT_LOCAL.test(code);
+ }
+ 
+@@ -66,8 +100,9 @@ export const THEME_GUIDE = [
+   `Roles: ${THEME_COLOR_ROLES.join(", ")}.`,
+   "",
+   "CSS: `css` applies after the app's styles. Use `.dark` or `:root:not(.dark)` for one appearance.",
+-  "It cannot load files: no @import, no image-set(), and url() only with data: or #id.",
+-  "A background image must be embedded as a data: address. `css` holds 20,000 characters, so keep the image near 10 KB.",
++  "It cannot load remote files: no @import, no image-set(), and url() only with data:, #id, or theme-file:.",
++  "A background image is embedded as a data: address or named as url(theme-file:NAME). `css` holds 20,000 characters, so keep an embedded image near 10 KB.",
++  "theme-file names an avif, webp, png, jpg, or gif of up to 4 MB in the themes directory, next to the published theme files. You cannot write it with this tool; put it there with a shell command.",
+   "The app's own rules can be more specific. If a rule has no effect, add !important.",
+   "It cannot reach the terminal text, the file tree, or diff internals. Use color roles for those.",
+   "Native scrollbars take `::-webkit-scrollbar` and `::-webkit-scrollbar-thumb`.",
