@@ -47,6 +47,11 @@ MAC_SEARCH = [Path('/Applications'), HOME / 'Applications']
 MAC_APP = 'T3 Code (Nightly).app'
 MAC_LAUNCHER = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
 MAC_BUNDLE_ID = 'com.t3tools.t3code'
+MAC_AGENTS = HOME / 'Library/LaunchAgents'
+# Opens T3 Code with the customization at login.
+MAC_LOGIN_AGENT = 'io.github.btsouth.t3code-customize.login'
+# Reopens a T3 Code that was started some other way (Dock, Finder, a link) with the customization.
+MAC_WATCH_AGENT = 'io.github.btsouth.t3code-customize.watch'
 ARCH = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}
 AGENTS = {
     'claude': ['claude', '-p', '--dangerously-skip-permissions'],
@@ -404,23 +409,33 @@ def node_major(node):
         return 0
 
 
-def ensure_node(log):
+def required_node_major(commit):
+    """The Node major the source pins in package.json engines, at least 24."""
+    try:
+        engines = json.loads(git('show', commit + ':package.json')).get('engines', {}).get('node', '')
+        return max(24, int(re.search(r'\d+', engines).group()))
+    except (subprocess.CalledProcessError, ValueError, AttributeError):
+        return 24
+
+
+def ensure_node(commit, log):
     """Use the system Node if it is new enough, else a private copy from nodejs.org."""
+    major = required_node_major(commit)
     system = shutil.which('node')
-    if system and node_major(system) >= 24:
+    if system and node_major(system) >= major:
         return None
     arch = ARCH.get(os.uname().machine)
     if not arch:
-        raise Stop('Node 24 or newer is required. Install it and run again.')
+        raise Stop(f'Node {major} or newer is required. Install it and run again.')
     # nodejs.org names the macOS builds darwin-* and lists them as osx-*-tar.
     platform, listed = ('darwin', f'osx-{arch}-tar') if MAC else ('linux', f'linux-{arch}')
-    private = sorted((CACHE / 'node').glob(f'node-v24.*-{platform}-{arch}'), key=version_key)
-    if private and node_major(str(private[-1] / 'bin/node')) >= 24:
+    private = sorted((CACHE / 'node').glob(f'node-v{major}.*-{platform}-{arch}'), key=version_key)
+    if private and node_major(str(private[-1] / 'bin/node')) >= major:
         return private[-1] / 'bin'
-    step('Downloading Node 24 (one time, private to this tool)...')
+    step(f'Downloading Node {major} (one time, private to this tool)...')
     with urllib.request.urlopen('https://nodejs.org/dist/index.json', timeout=30) as response:
         releases = json.load(response)
-    version = next(r['version'] for r in releases if r['version'].startswith('v24.') and listed in r['files'])
+    version = next(r['version'] for r in releases if r['version'].startswith(f'v{major}.') and listed in r['files'])
     name = f'node-{version}-{platform}-{arch}'
     base = f'https://nodejs.org/dist/{version}/'
     with urllib.request.urlopen(base + 'SHASUMS256.txt', timeout=30) as response:
@@ -652,7 +667,9 @@ def install_launcher(appimage):
         BIN.unlink(missing_ok=True)
         BIN.symlink_to(REPO / NAME)
     if MAC:
-        install_mac_launcher(appimage)
+        # The agents open T3 Code with the customization, so the regular icon is enough.
+        shutil.rmtree(MAC_LAUNCHER, ignore_errors=True)
+        install_mac_agents()
     else:
         install_desktop_entry()
     if str(BIN.parent) not in os.environ.get('PATH', '').split(os.pathsep):
@@ -684,6 +701,39 @@ def install_mac_launcher(app):
     if icon.exists():
         shutil.copy2(icon, contents / 'Resources/icon.icns')
     os.utime(MAC_LAUNCHER, None)
+
+
+def mac_agent_plist(label):
+    return MAC_AGENTS / (label + '.plist')
+
+
+def install_mac_agents():
+    """Login and watch agents, so the regular T3 Code icon opens the customized build."""
+    MAC_AGENTS.mkdir(parents=True, exist_ok=True)
+    logs = CACHE / 'logs'
+    env = {key: os.environ[key] for key in ('XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME') if os.environ.get(key)}
+    for label, command, extra in ((MAC_LOGIN_AGENT, 'launch', {}),
+                                  (MAC_WATCH_AGENT, 'watch', {'KeepAlive': True, 'ThrottleInterval': 30})):
+        plist = {'Label': label, 'ProgramArguments': [sys.executable, str(REPO / NAME), command],
+                 'RunAtLoad': True, 'ProcessType': 'Interactive',
+                 'StandardOutPath': str(logs / (command + '.log')), 'StandardErrorPath': str(logs / (command + '.log')),
+                 **({'EnvironmentVariables': env} if env else {}), **extra}
+        path = mac_agent_plist(label)
+        if path.exists() and plistlib.loads(path.read_bytes()) == plist:
+            continue
+        with path.open('wb') as out:
+            plistlib.dump(plist, out)
+        # The login agent waits for the next login; loading it now would bring T3 Code forward.
+        if label == MAC_WATCH_AGENT:
+            target = f'gui/{os.getuid()}'
+            subprocess.run(['launchctl', 'bootout', f'{target}/{label}'], check=False, capture_output=True)
+            subprocess.run(['launchctl', 'bootstrap', target, str(path)], check=False, capture_output=True)
+
+
+def remove_mac_agents():
+    for label in (MAC_LOGIN_AGENT, MAC_WATCH_AGENT):
+        subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/{label}'], check=False, capture_output=True)
+        mac_agent_plist(label).unlink(missing_ok=True)
 
 
 def install_desktop_entry():
@@ -721,7 +771,7 @@ def cmd_build(args):
     if (not args.force and not args.resume and state.get('stock') == fingerprint(appimage)
             and state.get('recipe') == recipe and built().exists()):
         install_launcher(appimage)
-        say(f'\nAlready up to date. Open "{LAUNCHER_NAME}" from your app launcher.')
+        say('\nAlready up to date. ' + ('Quit T3 Code fully and reopen it.' if MAC else f'Open "{LAUNCHER_NAME}" from your app launcher.'))
         return
     DATA.mkdir(parents=True, exist_ok=True)
     logs = CACHE / 'logs'
@@ -752,9 +802,8 @@ def cmd_build(args):
         say(f'    Nightly {version}, upstream commit {commit[:12]}')
         if len(config) != len(PUBLIC_CONFIG):
             say('    Note: could not read T3 Connect config from your app; sign-in may not work in this build.')
-        node_bin = ensure_node(log)
-        env = build_env(node_bin)
         target = ensure_commit(commit, version, log)
+        env = build_env(ensure_node(target, log))
         step('Applying the patches...')
         attempts = 2
         resume = ported = args.resume
@@ -815,7 +864,7 @@ def cmd_build(args):
     if DISABLED.exists():
         say(f'Customization is switched off. Run {NAME} on to use it.')
     else:
-        say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from your app launcher.')
+        say('Quit T3 Code fully and reopen it.' if MAC else f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from your app launcher.')
         say('First time? Turn on Settings > General > Stats for nerds.')
 
 
@@ -844,8 +893,8 @@ def cmd_verify(args):
     base = (REPO / 'patches/base.txt').read_text().strip()
     with (logs / ('verify-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w') as log:
         say('Log: ' + log.name)
-        env = build_env(ensure_node(log))
         target = ensure_commit(base, None, log)
+        env = build_env(ensure_node(target, log))
         prepare(target, log)
         install_dependencies(env, log)
         checks(env, log)
@@ -903,6 +952,61 @@ def launch_mac(app, target, rest):
         say(f'Opened T3 Code with the customization from {target}.')
 
 
+def mac_main_processes(binary):
+    """PIDs of T3 Code main processes, and whether each one started with the customization hook."""
+    out = subprocess.run(['ps', '-axo', 'pid=,ppid=,args='], capture_output=True, text=True).stdout
+    found = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        # The main process is started by launchd; the backend and helpers are its children.
+        if len(parts) == 3 and parts[1] == '1' and parts[2].startswith(str(binary)):
+            found[int(parts[0])] = '--inspect-brk' in parts[2][len(str(binary)):]
+    return found
+
+
+def mac_quit_and_wait(timeout=20):
+    subprocess.run(['osascript', '-e', f'tell application id "{MAC_BUNDLE_ID}" to quit'], check=False, capture_output=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not mac_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def cmd_watch(args):
+    """Reopens T3 Code with the customization when something starts it stock."""
+    if not MAC:
+        raise Stop('watch is for macOS.')
+    app = find_app()
+    binary = mac_binary(app)
+    # Instances already running when the watcher starts are left alone, so loading it never quits T3 Code.
+    seen = set(mac_main_processes(binary))
+    quiet_until = 0.0
+    say(time.strftime('%Y-%m-%d %H:%M:%S') + ' Watching for T3 Code started without the customization.')
+    while True:
+        time.sleep(1)
+        for pid, hooked in mac_main_processes(binary).items():
+            if pid in seen:
+                continue
+            seen.add(pid)
+            target, notice = launch_target()
+            # Only when the customization is on and current, and never twice in a row, so a failed
+            # relaunch that opens stock does not loop.
+            if hooked or target == app or notice or time.time() < quiet_until:
+                continue
+            quiet_until = time.time() + 60
+            say(time.strftime('%Y-%m-%d %H:%M:%S') + f' T3 Code {pid} started stock; reopening it with the customization.')
+            # Give it a moment to finish starting, so the quit request is received.
+            time.sleep(1.5)
+            if not mac_quit_and_wait():
+                say('T3 Code did not quit; leaving it running stock.')
+                continue
+            launch_mac(app, target, [])
+        if not mac_running():
+            seen.clear()
+
+
 def cmd_launch(args):
     appimage = find_app()
     target, notice = launch_target()
@@ -945,6 +1049,8 @@ def cmd_uninstall(args):
         BIN.unlink()
     DESKTOP.unlink(missing_ok=True)
     shutil.rmtree(MAC_LAUNCHER, ignore_errors=True)
+    if MAC:
+        remove_mac_agents()
     for folder in (DATA, CACHE, CONFIG):
         shutil.rmtree(folder, ignore_errors=True)
     tail = '' if DATA in REPO.parents else f' You can delete {REPO} too.'
@@ -972,12 +1078,13 @@ def main():
     sub.add_parser('off', help='go back to stock T3 Code')
     sub.add_parser('verify', help='apply the patches to their base and run the checks (for CI)')
     sub.add_parser('uninstall', help='remove the launcher, builds and caches')
+    sub.add_parser('watch', help='macOS: reopen T3 Code with the customization when it starts stock (run by a login agent)')
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
         argv = ['build', *argv]
     args = parser.parse_args(argv)
     handler = globals()['cmd_' + args.command]
-    if args.command in ('launch', 'status', 'on', 'off'):
+    if args.command in ('launch', 'status', 'on', 'off', 'watch'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
     with (CACHE / 'lock').open('w') as lock:
