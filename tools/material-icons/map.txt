@@ -44,8 +44,8 @@ ChevronsDownUp unfold_less
 ChevronsLeftRightEllipsis settings_ethernet
 ChevronsUpDown unfold_more
 CircleAlert error
-CircleDashed data_usage
-CircleDotDashed motion_photos_on
+CircleDashed @dashed_circle
+CircleDotDashed @dashed_circle_dot
 CircleDot radio_button_checked
 Circle circle
 CircleSlash block

@@ -19,7 +19,32 @@ CACHE = HERE / '.cache' / VERSION
 OUT = 'apps/web/src/components/icons/materialSymbols.generated.tsx'
 
 
+def dashed_circle(dot=False, dashes=8, sweep=27, outer=400, inner=340):
+    """Lucide's dashed circle at Material's stroke weight; Material Symbols has no such glyph."""
+    cap = (outer - inner) / 2
+
+    def at(radius, degrees):
+        a = math.radians(degrees)
+        return f'{480 + radius * math.sin(a):.0f} {-480 - radius * math.cos(a):.0f}'
+
+    out = []
+    for i in range(dashes):
+        a0 = i * 360 / dashes - sweep / 2
+        a1 = a0 + sweep
+        out.append(f'M{at(outer, a0)}A{outer} {outer} 0 0 1 {at(outer, a1)}A{cap:.0f} {cap:.0f} 0 0 1 {at(inner, a1)}'
+                   f'A{inner} {inner} 0 0 0 {at(inner, a0)}A{cap:.0f} {cap:.0f} 0 0 1 {at(outer, a0)}Z')
+    if dot:
+        out.append('M480 -550A70 70 0 1 1 480 -410A70 70 0 1 1 480 -550Z')
+    return ''.join(out)
+
+
+# Glyphs drawn here because Material Symbols has no equivalent. map.txt names them with a leading @.
+CUSTOM = {'@dashed_circle': lambda: dashed_circle(), '@dashed_circle_dot': lambda: dashed_circle(dot=True)}
+
+
 def path_data(symbol):
+    if symbol in CUSTOM:
+        return CUSTOM[symbol]()
     file = CACHE / f'{symbol}.svg'
     if not file.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
@@ -120,7 +145,7 @@ def main():
         '',
         'const paths = {',
     ]
-    out += [f'  {symbol}: "{path_data(symbol)}",' for symbol in symbols]
+    out += [f'  {symbol.lstrip("@")}: "{path_data(symbol)}",' for symbol in symbols]
     out += ['} as const;', '']
     steps = len(LOADER_SHAPES)
     out += [
@@ -137,7 +162,7 @@ def main():
             out.append(f'export const {lucide}Icon = symbol("{kebab(lucide)}", "{first}", LOADER_SHAPES);')
             out.append(f'export const {lucide} = {lucide}Icon;')
             continue
-        out.append(f'export const {lucide}Icon = symbol("{kebab(lucide)}", paths.{symbol});')
+        out.append(f'export const {lucide}Icon = symbol("{kebab(lucide)}", paths.{symbol.lstrip("@")});')
         out.append(f'export const {lucide} = {lucide}Icon;')
     target = Path(sys.argv[1]) / OUT
     target.parent.mkdir(parents=True, exist_ok=True)
