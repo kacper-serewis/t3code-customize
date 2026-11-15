@@ -23,7 +23,8 @@
     "apps/web/src/components/usage/proxyObservability.test.ts",
     "apps/web/src/lib/proxyRouting.test.ts",
     "packages/shared/src/themeCss.test.ts",
-    "apps/server/src/environmentTheme.test.ts"
+    "apps/server/src/environmentTheme.test.ts",
+    "apps/web/src/lib/materialIconAlias.test.ts"
   ],
   "typecheck": [
     "apps/server",

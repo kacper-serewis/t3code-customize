@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:50:43 +0100
-Subject: [PATCH 10/12] Local: proxy forecasts, subagents and panel link
+Subject: [PATCH 10/13] Local: proxy forecasts, subagents and panel link
 
 - Usage page, wide layout: each account segment carries its week sparkline
   and a "next" badge on the account the proxy gives the next new chat, which

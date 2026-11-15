@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Fri, 6 Nov 2026 11:15:48 +0100
-Subject: [PATCH 11/12] Local: drag the window from empty sidebar space
+Subject: [PATCH 11/13] Local: drag the window from empty sidebar space
 
 On desktop, the empty space below the thread list now moves the window, like
 the title bar. The thread list no longer stretches to fill the sidebar;
