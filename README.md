@@ -46,6 +46,20 @@ Upstream moves fast, and sometimes a nightly changes the code the patches touch.
 
 Your current T3 Code keeps working the whole time.
 
+## Choosing patches
+
+Every patch is on by default. To leave some out, run `t3code-customize patches`. It lists them and asks which to toggle, then offers to rebuild. Or name them directly:
+
+```sh
+t3code-customize patches off stats material-icons   # by id
+t3code-customize patches on 11                      # or by number
+t3code-customize patches on --all
+```
+
+Some patches build on others. Turning one on also turns on what it needs, and turning one off also turns off what needs it. Your choice is kept in `~/.config/t3code-customize/config.json` and applies to every later build. New patches start out on.
+
+This also helps when a nightly breaks one patch: turn it off and build the rest without waiting for a port. A port made while some patches are off is not saved to `patches/`, because it only covers part of the set.
+
 ## How it works
 
 T3 Code is open source (MIT). This repo holds four patches and one script. The script:
@@ -65,6 +79,7 @@ Everything runs on your machine. Your app and your T3 data are never modified.
 t3code-customize             update the patches and build for your installed T3 Code
 t3code-customize status      show what the next launch opens
 t3code-customize off | on    switch between stock and the customized build
+t3code-customize patches     list the patches and pick which ones to build
 t3code-customize uninstall   remove it, its launcher or login agents, builds and caches
 ```
 
