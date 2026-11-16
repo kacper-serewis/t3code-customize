@@ -1115,15 +1115,39 @@ def mac_main_processes(binary):
         parts = line.strip().split(None, 2)
         # The main process is started by launchd; the backend and helpers are its children.
         if len(parts) == 3 and parts[1] == '1' and parts[2].startswith(str(binary)):
-            found[int(parts[0])] = '--inspect-brk' in parts[2][len(str(binary)):]
+            rest = parts[2][len(str(binary)):].split()
+            # The binary also runs scripts as plain Node (the t3 CLI, connect.mjs). Those are not the app,
+            # and one left behind by a parent that exited also has launchd as its parent.
+            if rest and not rest[0].startswith('-'):
+                continue
+            found[int(parts[0])] = any(arg.startswith('--inspect-brk') for arg in rest)
     return found
 
 
-def mac_quit_and_wait(timeout=20):
-    subprocess.run(['osascript', '-e', f'tell application id "{MAC_BUNDLE_ID}" to quit'], check=False, capture_output=True)
+def mac_app_pid(pid, action='check'):
+    """Whether pid is a running macOS app (not a background process); with action='quit', asks only it to quit."""
+    script = (f"ObjC.import('AppKit'); var a = $.NSRunningApplication.runningApplicationWithProcessIdentifier({int(pid)});"
+              f" a.isNil() ? 'none' : ({'a.terminate, ' if action == 'quit' else ''}'app')")
+    return subprocess.run(['osascript', '-l', 'JavaScript', '-e', script],
+                          capture_output=True, text=True).stdout.strip() == 'app'
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def mac_quit_and_wait(pid, timeout=20):
+    """Quits the one T3 Code process pid, leaving any other running instance alone."""
+    mac_app_pid(pid, 'quit')
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not mac_running():
+        if not pid_alive(pid):
             return True
         time.sleep(0.5)
     return False
@@ -1150,11 +1174,14 @@ def cmd_watch(args):
             # relaunch that opens stock does not loop.
             if hooked or target == app or notice or time.time() < quiet_until:
                 continue
-            quiet_until = time.time() + 60
-            say(time.strftime('%Y-%m-%d %H:%M:%S') + f' T3 Code {pid} started stock; reopening it with the customization.')
             # Give it a moment to finish starting, so the quit request is received.
             time.sleep(1.5)
-            if not mac_quit_and_wait():
+            # Only a real app window counts; a short-lived process that is gone or not an app is ignored.
+            if not pid_alive(pid) or not mac_app_pid(pid):
+                continue
+            quiet_until = time.time() + 60
+            say(time.strftime('%Y-%m-%d %H:%M:%S') + f' T3 Code {pid} started stock; reopening it with the customization.')
+            if not mac_quit_and_wait(pid):
                 say('T3 Code did not quit; leaving it running stock.')
                 continue
             launch_mac(app, target, [])
