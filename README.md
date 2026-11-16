@@ -11,6 +11,7 @@ Unofficial. Not affiliated with T3 Tools. For T3 Code Nightly on Linux (AppImage
 - **Tokens per second** for the last response, with turn time and token details on hover. Claude rates are measured from the stream; Codex rates are labeled approximate.
 - **Cache rate** for the last turn.
 - **Subscription switch** when you have more than one signed-in subscription that offers your model. If the current one is on pace to run out before its 5 hour or weekly window resets, a chip like **Opus 5.5 on Personal →** switches the thread to the same model on the one with the most room. It also points out a subscription whose weekly allowance resets within a day mostly unused. Hover it for the reasoning.
+- **Benchmark scores** from [Artificial Analysis](https://artificialanalysis.ai/) in the model picker: each model's best Intelligence Index, and each effort level's score, speed and cost per task in the effort column. It needs a free API key from Artificial Analysis in `~/.t3/userdata/artificial-analysis-api-key` (or `ARTIFICIAL_ANALYSIS_API_KEY`). The server fetches the scores once a day.
 
 Everything else is stock T3 Code, including T3 Connect and the mobile app.
 

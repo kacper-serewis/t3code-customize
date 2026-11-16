@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Kacper=20Serewi=C5=9B?= <kacper@serewis.nl>
 Date: Mon, 16 Nov 2026 00:43:55 +0100
-Subject: [PATCH 13/13] Local: Material Symbols Rounded icons in place of
+Subject: [PATCH 13/14] Local: Material Symbols Rounded icons in place of
  Lucide
 
 The web build resolves app imports of lucide-react to a generated module that
