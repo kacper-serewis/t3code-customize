@@ -14,10 +14,10 @@ mobile are unchanged.
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 58cb50ae04..260f383777 100644
+index e6cdb90d5c..6629948046 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -3186,7 +3186,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3199,7 +3199,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            </SidebarGroup>
          }
        >
@@ -26,7 +26,7 @@ index 58cb50ae04..260f383777 100644
            {isSearchingThreads ? (
              threadSearchResults.length > 0 ? (
                <TooltipProvider
-@@ -3648,6 +3648,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3661,6 +3661,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
              </TooltipProvider>
            ) : null}
          </SidebarGroup>

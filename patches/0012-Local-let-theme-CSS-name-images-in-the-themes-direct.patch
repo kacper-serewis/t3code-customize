@@ -18,20 +18,20 @@ the web client no longer stores CSS that large for its boot paint.
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
  apps/server/src/environmentTheme.test.ts | 28 ++++++++
- apps/server/src/environmentTheme.ts      | 91 +++++++++++++++++++++---
+ apps/server/src/environmentTheme.ts      | 92 +++++++++++++++++++++---
  apps/web/src/themePalette.ts             |  9 ++-
  packages/contracts/src/server.ts         |  6 ++
  packages/shared/src/themeCss.test.ts     | 51 ++++++++++++-
- packages/shared/src/themeCss.ts          | 41 ++++++++++-
- 6 files changed, 213 insertions(+), 13 deletions(-)
+ packages/shared/src/themeCss.ts          | 39 +++++++++-
+ 6 files changed, 213 insertions(+), 12 deletions(-)
 
 diff --git a/apps/server/src/environmentTheme.test.ts b/apps/server/src/environmentTheme.test.ts
-index 241c89546c..a21494c650 100644
+index a0bd921ad3..c0c7efed19 100644
 --- a/apps/server/src/environmentTheme.test.ts
 +++ b/apps/server/src/environmentTheme.test.ts
-@@ -304,6 +304,34 @@ it.layer(NodeServices.layer)("environment theme", (it) => {
-     );
-   });
+@@ -333,6 +333,34 @@ it.layer(NodeServices.layer)("environment theme", (it) => {
+       ),
+   );
  
 +  it.effect("serves a named image inlined and reads the theme back as written", () =>
 +    withEnvironmentThemes(
@@ -65,10 +65,10 @@ index 241c89546c..a21494c650 100644
      const large = (name: string): EnvironmentThemeFile => ({
        ...NIGHTFALL_THEME,
 diff --git a/apps/server/src/environmentTheme.ts b/apps/server/src/environmentTheme.ts
-index 1e7f4d3052..94598cf7fc 100644
+index 0d45fd02de..514b3e792e 100644
 --- a/apps/server/src/environmentTheme.ts
 +++ b/apps/server/src/environmentTheme.ts
-@@ -12,7 +12,11 @@ import {
+@@ -13,7 +13,11 @@ import {
    THEME_CSS_MAX_LENGTH,
  } from "@t3tools/contracts";
  import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
@@ -81,7 +81,7 @@ index 1e7f4d3052..94598cf7fc 100644
  import { BUILT_IN_THEME_IDS, UNPUBLISHABLE_THEME_IDS } from "@t3tools/shared/themePalettes";
  import * as Cause from "effect/Cause";
  import * as Context from "effect/Context";
-@@ -51,6 +55,12 @@ const MAX_THEME_FILES = 32;
+@@ -52,6 +56,12 @@ const MAX_THEME_FILES = 32;
   */
  export const MAX_THEME_FILE_BYTES = 6 * THEME_CSS_MAX_LENGTH + 16 * 1024;
  const MAX_THEME_TOTAL_BYTES = 6 * MAX_THEME_FILE_BYTES;
@@ -92,9 +92,9 @@ index 1e7f4d3052..94598cf7fc 100644
 +/** Every image inlined in one read of the directory. */
 +const MAX_THEME_IMAGES_TOTAL_BYTES = 32 * 1024 * 1024;
  
- interface PublishedThemes {
-   readonly seq: number;
-@@ -139,7 +149,7 @@ const pathIsTaken = (filePath: string): boolean => {
+ /** A theme's background is `<id>.<extension>` beside `<id>.json`; earlier extensions win. */
+ const THEME_BACKGROUND_EXTENSIONS = ["webp", "png", "jpg", "jpeg"] as const;
+@@ -146,7 +156,7 @@ const pathIsTaken = (filePath: string): boolean => {
  
  /** Validates and reads one handle; rejects symlinked files, allows symlinked directories.
   * Uses non-blocking opens against FIFOs; Windows lacks these flags and checks symlinks with lstat. */
@@ -103,7 +103,7 @@ index 1e7f4d3052..94598cf7fc 100644
    let fd: number;
    try {
      if (NodeFS.constants.O_NOFOLLOW === undefined && NodeFS.lstatSync(filePath).isSymbolicLink()) {
-@@ -164,8 +174,7 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
+@@ -171,8 +181,7 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
        if (read <= 0) break;
        offset += read;
      }
@@ -113,9 +113,9 @@ index 1e7f4d3052..94598cf7fc 100644
    } catch {
      return null;
    } finally {
-@@ -173,7 +182,21 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
-   }
- };
+@@ -209,7 +218,21 @@ export function findThemeBackground(
+   return null;
+ }
  
 -export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
 +/** The same guarded read, as text. */
@@ -136,8 +136,8 @@ index 1e7f4d3052..94598cf7fc 100644
    const fs = yield* FileSystem.FileSystem;
    const entries = yield* fs
      .readDirectory(themesDir)
-@@ -182,6 +205,43 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
-   const themes: Array<EnvironmentTheme> = [];
+@@ -219,6 +242,43 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+   const entryNames = new Set(entries);
    let examined = 0;
    let totalBytes = 0;
 +
@@ -180,15 +180,16 @@ index 1e7f4d3052..94598cf7fc 100644
    for (const entry of entries.toSorted()) {
      if (!entry.endsWith(THEME_FILE_SUFFIX)) continue;
      const id = entry.slice(0, -THEME_FILE_SUFFIX.length);
-@@ -232,7 +292,18 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
-       break;
+@@ -270,7 +330,19 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
      }
  
--    themes.push({ id, ...file });
+     const background = findThemeBackground(themesDir, id, entryNames);
+-    themes.push({ id, ...file, ...(background ? { background: background.revision } : {}) });
 +    themes.push({
 +      id,
 +      ...file,
 +      ...(options.inlineImages && file.css !== undefined ? { css: inlineImages(file.css) } : {}),
++      ...(background ? { background: background.revision } : {}),
 +    });
 +  }
 +  if (skippedImages.size > 0) {
@@ -200,7 +201,7 @@ index 1e7f4d3052..94598cf7fc 100644
    }
    return themes;
  });
-@@ -251,7 +322,7 @@ const make = Effect.gen(function* () {
+@@ -289,7 +361,7 @@ const make = Effect.gen(function* () {
  
    const refresh = refreshSemaphore.withPermits(1)(
      Effect.gen(function* () {
@@ -209,24 +210,24 @@ index 1e7f4d3052..94598cf7fc 100644
          Effect.provideService(FileSystem.FileSystem, fs),
        );
        // Compare the whole value so new fields cannot silently miss republishes.
-@@ -415,7 +486,11 @@ const make = Effect.gen(function* () {
+@@ -454,7 +526,11 @@ const make = Effect.gen(function* () {
          known: themes.map(({ id }) => id),
        });
      }
--    return { current: defaultTheme, themes, theme };
+-    return { current: defaultTheme, themesDir, themes, theme };
 +    // The served copy has its images inlined. Whoever reads a theme gets the file as written.
 +    const written = (yield* readPublishedThemes(environmentThemesDir).pipe(
 +      Effect.provideService(FileSystem.FileSystem, fs),
 +    )).find((candidate) => candidate.id === themeId);
-+    return { current: defaultTheme, themes, theme: written ?? theme };
++    return { current: defaultTheme, themesDir, themes, theme: written ?? theme };
    });
  
    return {
 diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
-index 1abd73b2ce..754d3f0c89 100644
+index 5e85922759..7a94ec3270 100644
 --- a/apps/web/src/themePalette.ts
 +++ b/apps/web/src/themePalette.ts
-@@ -355,8 +355,15 @@ export const environmentThemeDefinitionsAtom = Atom.make((get) => {
+@@ -356,8 +356,15 @@ export const environmentThemeDefinitionsAtom = Atom.make((get) => {
  
  export function storePublishedEnvironmentThemes(definitions: ReadonlyArray<ThemeDefinition>) {
    if (appAtomRegistry.get(publishedThemesAtom) === null) return;
@@ -244,7 +245,7 @@ index 1abd73b2ce..754d3f0c89 100644
      // Without the stored copy the next launch paints stock colors until connect.
    }
 diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
-index 144d2814b8..06a817ceb0 100644
+index f2e02c6b0a..0f6093a804 100644
 --- a/packages/contracts/src/server.ts
 +++ b/packages/contracts/src/server.ts
 @@ -628,6 +628,11 @@ const EnvironmentThemeColors = Schema.Record(
@@ -259,10 +260,10 @@ index 144d2814b8..06a817ceb0 100644
  
  const environmentThemeFields = {
    version: Schema.optional(Schema.Literal(1)),
-@@ -653,6 +658,7 @@ export type EnvironmentThemeFile = typeof EnvironmentThemeFile.Type;
- export const EnvironmentTheme = Schema.Struct({
-   id: EnvironmentThemeId,
+@@ -655,6 +660,7 @@ export const EnvironmentTheme = Schema.Struct({
    ...environmentThemeFields,
+   /** Revision of the image file published beside the theme; absent without one. */
+   background: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(64))),
 +  css: Schema.optional(Schema.String.check(Schema.isMaxLength(THEME_SERVED_CSS_MAX_LENGTH))),
  });
  export type EnvironmentTheme = typeof EnvironmentTheme.Type;
@@ -333,7 +334,7 @@ index 80656a8207..22ae45910a 100644
 +  });
 +});
 diff --git a/packages/shared/src/themeCss.ts b/packages/shared/src/themeCss.ts
-index 26a72b4117..e2afbb2d3a 100644
+index 910b18150f..9c0c4d0502 100644
 --- a/packages/shared/src/themeCss.ts
 +++ b/packages/shared/src/themeCss.ts
 @@ -16,6 +16,39 @@ function fetchesByText(code: string): boolean {
@@ -391,10 +392,9 @@ index 26a72b4117..e2afbb2d3a 100644
    "",
    "CSS: `css` applies after the app's styles. Use `.dark` or `:root:not(.dark)` for one appearance.",
 -  "It cannot load files: no @import, no image-set(), and url() only with data: or #id.",
--  "A background image must be embedded as a data: address. `css` holds 50,000 characters, so keep the image near 30 KB.",
 +  "It cannot load remote files: no @import, no image-set(), and url() only with data:, #id, or theme-file:.",
-+  "A background image is embedded as a data: address or named as url(theme-file:NAME). `css` holds 50,000 characters, so keep an embedded image near 30 KB.",
-+  "theme-file names an avif, webp, png, jpg, or gif of up to 4 MB in the themes directory, next to the published theme files. You cannot write it with this tool; put it there with a shell command.",
+   'For a background image, copy a JPEG, PNG, or WebP file of up to 16 MB to `<themesDir>/<themeId>.jpg` (or .png, .webp), beside the theme file. CSS shows it with `var(--theme-background-image)`, such as `[data-workspace-area="conversation"] { background: var(--theme-background-image) center / cover no-repeat; }`. Delete the file to remove it. Do not embed images in `css`: it holds 50,000 characters.',
++  "For more images, `url(theme-file:NAME)` names an avif, webp, png, jpg, or gif of up to 4 MB in `<themesDir>`, and the server inlines it. Put the file there with a shell command.",
    "The app's own rules can be more specific. If a rule has no effect, add !important.",
    "It cannot reach the terminal text, the file tree, or diff internals. Use color roles for those.",
    "Native scrollbars take `::-webkit-scrollbar` and `::-webkit-scrollbar-thumb`.",
