@@ -26,10 +26,10 @@ Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
  6 files changed, 213 insertions(+), 13 deletions(-)
 
 diff --git a/apps/server/src/environmentTheme.test.ts b/apps/server/src/environmentTheme.test.ts
-index 1e8b538a66..c6cce2e7e4 100644
+index 241c89546c..a21494c650 100644
 --- a/apps/server/src/environmentTheme.test.ts
 +++ b/apps/server/src/environmentTheme.test.ts
-@@ -294,6 +294,34 @@ it.layer(NodeServices.layer)("environment theme", (it) => {
+@@ -304,6 +304,34 @@ it.layer(NodeServices.layer)("environment theme", (it) => {
      );
    });
  
@@ -65,11 +65,11 @@ index 1e8b538a66..c6cce2e7e4 100644
      const large = (name: string): EnvironmentThemeFile => ({
        ...NIGHTFALL_THEME,
 diff --git a/apps/server/src/environmentTheme.ts b/apps/server/src/environmentTheme.ts
-index b658870f2e..4a081f5ce9 100644
+index 1e7f4d3052..94598cf7fc 100644
 --- a/apps/server/src/environmentTheme.ts
 +++ b/apps/server/src/environmentTheme.ts
-@@ -11,7 +11,11 @@ import {
-   environmentThemeFileHasColors,
+@@ -12,7 +12,11 @@ import {
+   THEME_CSS_MAX_LENGTH,
  } from "@t3tools/contracts";
  import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 -import { themeCssLoadsRemoteFiles } from "@t3tools/shared/themeCss";
@@ -81,10 +81,10 @@ index b658870f2e..4a081f5ce9 100644
  import { BUILT_IN_THEME_IDS, UNPUBLISHABLE_THEME_IDS } from "@t3tools/shared/themePalettes";
  import * as Cause from "effect/Cause";
  import * as Context from "effect/Context";
-@@ -47,6 +51,12 @@ const MAX_THEME_FILES = 32;
- /** Shared with publishing so it cannot accept files the watcher skips. */
- export const MAX_THEME_FILE_BYTES = 32 * 1024;
- const MAX_THEME_TOTAL_BYTES = 192 * 1024;
+@@ -51,6 +55,12 @@ const MAX_THEME_FILES = 32;
+  */
+ export const MAX_THEME_FILE_BYTES = 6 * THEME_CSS_MAX_LENGTH + 16 * 1024;
+ const MAX_THEME_TOTAL_BYTES = 6 * MAX_THEME_FILE_BYTES;
 +/** One image that theme CSS names with `url(theme-file:NAME)`. */
 +const MAX_THEME_IMAGE_BYTES = 4 * 1024 * 1024;
 +/** Keeps one theme's served CSS, with its images as base64, under THEME_SERVED_CSS_MAX_LENGTH. */
@@ -94,7 +94,7 @@ index b658870f2e..4a081f5ce9 100644
  
  interface PublishedThemes {
    readonly seq: number;
-@@ -135,7 +145,7 @@ const pathIsTaken = (filePath: string): boolean => {
+@@ -139,7 +149,7 @@ const pathIsTaken = (filePath: string): boolean => {
  
  /** Validates and reads one handle; rejects symlinked files, allows symlinked directories.
   * Uses non-blocking opens against FIFOs; Windows lacks these flags and checks symlinks with lstat. */
@@ -103,7 +103,7 @@ index b658870f2e..4a081f5ce9 100644
    let fd: number;
    try {
      if (NodeFS.constants.O_NOFOLLOW === undefined && NodeFS.lstatSync(filePath).isSymbolicLink()) {
-@@ -160,8 +170,7 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
+@@ -164,8 +174,7 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
        if (read <= 0) break;
        offset += read;
      }
@@ -113,7 +113,7 @@ index b658870f2e..4a081f5ce9 100644
    } catch {
      return null;
    } finally {
-@@ -169,7 +178,21 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
+@@ -173,7 +182,21 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
    }
  };
  
@@ -136,7 +136,7 @@ index b658870f2e..4a081f5ce9 100644
    const fs = yield* FileSystem.FileSystem;
    const entries = yield* fs
      .readDirectory(themesDir)
-@@ -178,6 +201,43 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+@@ -182,6 +205,43 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
    const themes: Array<EnvironmentTheme> = [];
    let examined = 0;
    let totalBytes = 0;
@@ -180,7 +180,7 @@ index b658870f2e..4a081f5ce9 100644
    for (const entry of entries.toSorted()) {
      if (!entry.endsWith(THEME_FILE_SUFFIX)) continue;
      const id = entry.slice(0, -THEME_FILE_SUFFIX.length);
-@@ -228,7 +288,18 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+@@ -232,7 +292,18 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
        break;
      }
  
@@ -200,7 +200,7 @@ index b658870f2e..4a081f5ce9 100644
    }
    return themes;
  });
-@@ -247,7 +318,7 @@ const make = Effect.gen(function* () {
+@@ -251,7 +322,7 @@ const make = Effect.gen(function* () {
  
    const refresh = refreshSemaphore.withPermits(1)(
      Effect.gen(function* () {
@@ -209,7 +209,7 @@ index b658870f2e..4a081f5ce9 100644
          Effect.provideService(FileSystem.FileSystem, fs),
        );
        // Compare the whole value so new fields cannot silently miss republishes.
-@@ -411,7 +482,11 @@ const make = Effect.gen(function* () {
+@@ -415,7 +486,11 @@ const make = Effect.gen(function* () {
          known: themes.map(({ id }) => id),
        });
      }
@@ -223,7 +223,7 @@ index b658870f2e..4a081f5ce9 100644
  
    return {
 diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
-index a6bea8fb86..730536ae08 100644
+index 1abd73b2ce..754d3f0c89 100644
 --- a/apps/web/src/themePalette.ts
 +++ b/apps/web/src/themePalette.ts
 @@ -355,8 +355,15 @@ export const environmentThemeDefinitionsAtom = Atom.make((get) => {
@@ -244,13 +244,13 @@ index a6bea8fb86..730536ae08 100644
      // Without the stored copy the next launch paints stock colors until connect.
    }
 diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
-index 88fa0220fe..3c2ddec2e6 100644
+index 144d2814b8..06a817ceb0 100644
 --- a/packages/contracts/src/server.ts
 +++ b/packages/contracts/src/server.ts
-@@ -623,6 +623,11 @@ const EnvironmentThemeColors = Schema.Record(
+@@ -628,6 +628,11 @@ const EnvironmentThemeColors = Schema.Record(
  );
  
- export const THEME_CSS_MAX_LENGTH = 20_000;
+ export const THEME_CSS_MAX_LENGTH = 50_000;
 +/**
 + * Served CSS can be far longer than a theme file's: the server replaces each
 + * `url(theme-file:NAME)` with the image of that name from the themes directory.
@@ -259,7 +259,7 @@ index 88fa0220fe..3c2ddec2e6 100644
  
  const environmentThemeFields = {
    version: Schema.optional(Schema.Literal(1)),
-@@ -648,6 +653,7 @@ export type EnvironmentThemeFile = typeof EnvironmentThemeFile.Type;
+@@ -653,6 +658,7 @@ export type EnvironmentThemeFile = typeof EnvironmentThemeFile.Type;
  export const EnvironmentTheme = Schema.Struct({
    id: EnvironmentThemeId,
    ...environmentThemeFields,
@@ -268,13 +268,13 @@ index 88fa0220fe..3c2ddec2e6 100644
  export type EnvironmentTheme = typeof EnvironmentTheme.Type;
  
 diff --git a/packages/shared/src/themeCss.test.ts b/packages/shared/src/themeCss.test.ts
-index e3a4f1efeb..f4fde32c2e 100644
+index 80656a8207..22ae45910a 100644
 --- a/packages/shared/src/themeCss.test.ts
 +++ b/packages/shared/src/themeCss.test.ts
 @@ -1,6 +1,11 @@
  import { describe, expect, it } from "vite-plus/test";
  
--import { themeCssValueFetches } from "./themeCss.ts";
+-import { themeCssLoadsRemoteFiles, themeCssValueFetches } from "./themeCss.ts";
 +import {
 +  inlineThemeFiles,
 +  themeCssLoadsRemoteFiles,
@@ -282,10 +282,10 @@ index e3a4f1efeb..f4fde32c2e 100644
 +  themeFileMediaType,
 +} from "./themeCss.ts";
  
- describe("themeCssValueFetches", () => {
-   it.each([
-@@ -21,3 +26,47 @@ describe("themeCssValueFetches", () => {
-     expect(themeCssValueFetches(value)).toBe(fetches);
+ // %23 decodes to # inside the SVG, so url(%23g) names its own gradient.
+ const SVG_WITH_OWN_GRADIENT =
+@@ -36,3 +41,47 @@ describe("themeCssLoadsRemoteFiles", () => {
+     ).toBe(false);
    });
  });
 +
@@ -333,12 +333,12 @@ index e3a4f1efeb..f4fde32c2e 100644
 +  });
 +});
 diff --git a/packages/shared/src/themeCss.ts b/packages/shared/src/themeCss.ts
-index 48b1259d03..9f243385b8 100644
+index 26a72b4117..e2afbb2d3a 100644
 --- a/packages/shared/src/themeCss.ts
 +++ b/packages/shared/src/themeCss.ts
-@@ -4,6 +4,39 @@ const FETCHES_BY_STRING = /image-set\(|\bsrc\(/i;
- // Only CSS whitespace may come first. \s also matches U+00A0, which makes the address relative.
- const URL_NOT_LOCAL = /url\((?![ \t\n\f\r]*["']?(?:data:|#))/i;
+@@ -16,6 +16,39 @@ function fetchesByText(code: string): boolean {
+   return FETCHES_BY_STRING.test(outsideStrings) || URL_NOT_LOCAL.test(outsideStrings);
+ }
  
 +/** `url(theme-file:NAME)` names an image in the themes directory. The server inlines it. */
 +const THEME_FILE_URL =
@@ -376,24 +376,24 @@ index 48b1259d03..9f243385b8 100644
  /**
   * Whether one declaration value can load a remote file. Clients drop those declarations.
   * A value with var() stays unparsed until use, and an escape can spell `var` or `url` in it,
-@@ -15,7 +48,8 @@ export function themeCssValueFetches(value: string): boolean {
+@@ -27,7 +60,8 @@ export function themeCssValueFetches(value: string): boolean {
  
  /** A text check for early feedback. CSS escapes can dodge it; the client check is the guard. */
  export function themeCssLoadsRemoteFiles(css: string): boolean {
 -  const code = css.replace(/\/\*[\s\S]*?\*\//g, "");
 +  // The server swaps a theme file for a data: address before any client sees the CSS.
 +  const code = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(THEME_FILE_URL, "url(#theme-file)");
-   return /@import/i.test(code) || FETCHES_BY_STRING.test(code) || URL_NOT_LOCAL.test(code);
+   return /@import/i.test(code) || fetchesByText(code);
  }
  
-@@ -66,8 +100,9 @@ export const THEME_GUIDE = [
+@@ -78,8 +112,9 @@ export const THEME_GUIDE = [
    `Roles: ${THEME_COLOR_ROLES.join(", ")}.`,
    "",
    "CSS: `css` applies after the app's styles. Use `.dark` or `:root:not(.dark)` for one appearance.",
 -  "It cannot load files: no @import, no image-set(), and url() only with data: or #id.",
--  "A background image must be embedded as a data: address. `css` holds 20,000 characters, so keep the image near 10 KB.",
+-  "A background image must be embedded as a data: address. `css` holds 50,000 characters, so keep the image near 30 KB.",
 +  "It cannot load remote files: no @import, no image-set(), and url() only with data:, #id, or theme-file:.",
-+  "A background image is embedded as a data: address or named as url(theme-file:NAME). `css` holds 20,000 characters, so keep an embedded image near 10 KB.",
++  "A background image is embedded as a data: address or named as url(theme-file:NAME). `css` holds 50,000 characters, so keep an embedded image near 30 KB.",
 +  "theme-file names an avif, webp, png, jpg, or gif of up to 4 MB in the themes directory, next to the published theme files. You cannot write it with this tool; put it there with a shell command.",
    "The app's own rules can be more specific. If a rule has no effect, add !important.",
    "It cannot reach the terminal text, the file tree, or diff internals. Use color roles for those.",

@@ -68,18 +68,18 @@ index 69da770f1f..3838eed5d5 100644
            <TooltipTrigger
              render={
 diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
-index f316f60e61..cd235fdd22 100644
+index e9a884fde6..34e988483d 100644
 --- a/apps/web/src/components/chat/ModelPickerContent.tsx
 +++ b/apps/web/src/components/chat/ModelPickerContent.tsx
-@@ -66,6 +66,7 @@ import {
-   type ProviderInstanceEntry,
+@@ -67,6 +67,7 @@ import {
  } from "../../providerInstances";
  import { providerModelKey, sortProviderModelItems } from "../../modelOrdering";
+ import { hasRuntimeModelCatalog } from "../../providerModels";
 +import { pickerUsageByInstance, sortByPickerUsage } from "./ModelPickerUsage.logic";
  
  type ModelPickerItem = {
    slug: string;
-@@ -519,6 +520,17 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -520,6 +521,17 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
    const canOpenProviderSetup = onOpenProviderSetup !== undefined;
  
    const entryByInstanceId = new Map(instanceEntries.map((entry) => [entry.instanceId, entry]));
@@ -97,7 +97,7 @@ index f316f60e61..cd235fdd22 100644
    const matchesLockedProvider = (
      entry: Pick<ProviderInstanceEntry, "driverKind" | "continuationGroupKey">,
    ): boolean => {
-@@ -625,7 +637,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -626,7 +638,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
      return disabled;
    })();
    const sidebarInstanceEntries = (() => {
@@ -106,7 +106,7 @@ index f316f60e61..cd235fdd22 100644
      if (!isLocked) {
        return enabledEntries;
      }
-@@ -641,7 +653,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -642,7 +654,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
      return [...available, ...disabled];
    })();
    const showSidebar = !isSearching && sidebarInstanceEntries.length > 0;
@@ -115,7 +115,7 @@ index f316f60e61..cd235fdd22 100644
  
    const filteredModels = (() => {
      let result = flatModels;
-@@ -778,6 +790,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -779,6 +791,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
      modelJumpLabelByKey,
      activeModelKey,
      selectedModelKeySet,
@@ -123,7 +123,7 @@ index f316f60e61..cd235fdd22 100644
    };
  
    const onWindowKeyDown = (event: globalThis.KeyboardEvent) => {
-@@ -863,6 +876,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -864,6 +877,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
              onSelectInstance={handleSelectInstance}
              onFocusSearch={focusSearchInput}
              instanceEntries={sidebarInstanceEntries}
@@ -131,7 +131,7 @@ index f316f60e61..cd235fdd22 100644
              showFavorites
              {...(selectableUnavailableInstanceIds ? { selectableUnavailableInstanceIds } : {})}
              {...(lockedDisabledInstanceIds
-@@ -1048,6 +1062,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -1049,6 +1063,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                      driverKind={model.driverKind}
                      providerDisplayName={model.instanceDisplayName}
                      providerAccentColor={model.instanceAccentColor}

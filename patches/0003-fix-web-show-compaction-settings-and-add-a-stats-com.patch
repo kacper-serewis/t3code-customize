@@ -9,15 +9,15 @@ Subject: [PATCH 03/13] fix(web): show compaction settings and add a stats
  .../chat/ComposerStats.logic.test.ts          | 96 +++++++++++++++++++
  .../components/chat/ComposerStats.logic.ts    | 52 ++++++++++
  .../web/src/components/chat/ComposerStats.tsx | 73 ++++++++++++--
- apps/web/src/lib/contextWindow.test.ts        | 56 ++++++++++-
+ apps/web/src/lib/contextWindow.test.ts        | 59 +++++++++++-
  .../client-runtime/src/state/contextWindow.ts | 13 +--
- 6 files changed, 320 insertions(+), 25 deletions(-)
+ 6 files changed, 326 insertions(+), 22 deletions(-)
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 2bdfba70af..3c7e127beb 100644
+index 7f29ae6aeb..28138edae1 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -1518,20 +1518,40 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1520,20 +1520,40 @@ export default function ChatView(props: ChatViewProps) {
      const usageLimits = activeUsageLimits
        ? { limits: activeUsageLimits, providerName: activeProviderName }
        : null;
@@ -62,7 +62,7 @@ index 2bdfba70af..3c7e127beb 100644
        ),
      };
    })();
-@@ -2548,6 +2568,15 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2550,6 +2570,15 @@ export default function ChatView(props: ChatViewProps) {
      pendingApprovals.length > 0 ||
      pendingUserInputs.length > 0;
    const compactDisabled = compactThreadUnavailable;
@@ -78,7 +78,7 @@ index 2bdfba70af..3c7e127beb 100644
    // The context window is the current conversation's, so a handoff destination never inherits it.
    const resumeCompactionTokens =
      activeContextWindow &&
-@@ -3886,7 +3915,23 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3888,7 +3917,23 @@ export default function ChatView(props: ChatViewProps) {
                      </div>
                      {/* Opaque so timeline content scrolling under the overlay can't show through the stats line. */}
                      <div className={composerStats !== null ? "bg-background" : undefined}>
@@ -458,34 +458,22 @@ index 724cafe53c..fe42f03499 100644
                  <p className="text-muted-foreground">
                    Reported{" "}
 diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
-index f3540d3738..afeab1444b 100644
+index 91cdf18682..57f4d0531b 100644
 --- a/apps/web/src/lib/contextWindow.test.ts
 +++ b/apps/web/src/lib/contextWindow.test.ts
-@@ -21,7 +21,7 @@ const decodeTokenUsage = Schema.decodeSync(OrchestrationV2ProviderTurnTokenUsage
+@@ -47,9 +47,27 @@ const compactionEntry = (providerThreadId: string | null) =>
  
  describe("V2 context window presentation", () => {
    it("uses retained compaction token data when available", () => {
--    const snapshot = deriveLatestContextWindowSnapshot([
+-    const snapshot = deriveLatestContextWindowSnapshot([compactionEntry(null)]);
 +    const entries = [
-       {
-         item: {
-           id: "compaction-1" as never,
-@@ -35,8 +35,8 @@ describe("V2 context window presentation", () => {
-           ordinal: 1,
-           status: "completed",
-           title: null,
--          startedAt: null,
--          completedAt: null,
++      {
++        item: {
++          ...compactionEntry(null).item,
 +          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
 +          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-           updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-           type: "compaction",
-           driver: null,
-@@ -44,9 +44,19 @@ describe("V2 context window presentation", () => {
-           afterTokenCount: 2_000,
-         },
-       },
--    ]);
++        },
++      },
 +    ] as const;
 +    const snapshot = deriveLatestContextWindowSnapshot(entries);
 +    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
@@ -501,9 +489,9 @@ index f3540d3738..afeab1444b 100644
 +    expect(snapshot?.totalProcessedTokens).toBeNull();
 +    expect(snapshot?.compactsAutomatically).toBeNull();
    });
- });
  
-@@ -207,3 +217,39 @@ describe("latestProviderTurnTokenUsage", () => {
+   it("ignores a retired provider thread's compaction after a provider switch", () => {
+@@ -263,3 +281,40 @@ describe("latestProviderTurnTokenUsage", () => {
      }
    });
  });
@@ -518,6 +506,7 @@ index f3540d3738..afeab1444b 100644
 +        updatedAt: "2026-10-10T12:00:00.000Z",
 +      },
 +      {
++        id: ProviderThreadId.make("provider-thread"),
 +        contextUsage: {
 +          usedTokens: 300_000,
 +          autoCompactThreshold: 400_000,
@@ -544,10 +533,10 @@ index f3540d3738..afeab1444b 100644
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index 94be1e481a..0d3309365f 100644
+index a8f7e0f88c..7b47922808 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -105,8 +105,9 @@ export function deriveLatestContextWindowSnapshot(
+@@ -109,8 +109,9 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
@@ -559,7 +548,7 @@ index 94be1e481a..0d3309365f 100644
        cost: null,
        updatedAt: liveUsage.updatedAt,
      };
-@@ -148,7 +149,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -152,7 +153,7 @@ export function deriveLatestContextWindowSnapshot(
    }
    for (let index = entries.length - 1; index >= 0; index -= 1) {
      const entry = entries[index];
@@ -568,7 +557,7 @@ index 94be1e481a..0d3309365f 100644
        continue;
      }
      const payload = entry.item;
-@@ -166,7 +167,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -178,7 +179,7 @@ export function deriveLatestContextWindowSnapshot(
  
      return {
        usedTokens,
@@ -577,7 +566,7 @@ index 94be1e481a..0d3309365f 100644
        maxTokens,
        remainingTokens,
        usedPercentage,
-@@ -182,10 +183,10 @@ export function deriveLatestContextWindowSnapshot(
+@@ -194,10 +195,10 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,

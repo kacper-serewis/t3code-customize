@@ -155,7 +155,7 @@ index d6f867d621..5b9785557a 100644
  
    return {
 diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
-index eb24dba974..00fd95b5e7 100644
+index 91b6bca6ed..a20e527bff 100644
 --- a/apps/server/src/usage/cliproxyApi.ts
 +++ b/apps/server/src/usage/cliproxyApi.ts
 @@ -32,6 +32,7 @@ import {
@@ -166,7 +166,7 @@ index eb24dba974..00fd95b5e7 100644
  
  /** A hub with its management key already read from wherever the setting keeps it. */
  export interface CliproxyHub {
-@@ -408,13 +409,14 @@ export const makeCliproxyApi = Effect.gen(function* () {
+@@ -409,13 +410,14 @@ export const makeCliproxyApi = Effect.gen(function* () {
      hub: CliproxyHub,
      path: string,
      body?: unknown,
@@ -182,7 +182,7 @@ index eb24dba974..00fd95b5e7 100644
        },
        catch: () => new UsageLimitSourceError({ detail: "The hub URL is not valid." }),
      });
-@@ -562,5 +564,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
+@@ -563,5 +565,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
        ),
      );
    });
@@ -672,10 +672,10 @@ index 0000000000..b98a2b1cb2
 +  };
 +}
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index c96bd47a7a..b9ced7c91b 100644
+index 153b897b24..98df1d263c 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -336,6 +336,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
+@@ -340,6 +340,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
  import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
  import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
@@ -683,7 +683,7 @@ index c96bd47a7a..b9ced7c91b 100644
  import { ComposerStats } from "./chat/ComposerStats";
  import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
  import { ComposerSurface } from "./chat/ComposerSurface";
-@@ -2676,6 +2677,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2678,6 +2679,11 @@ export default function ChatView(props: ChatViewProps) {
            },
          })
        : null;
@@ -695,7 +695,7 @@ index c96bd47a7a..b9ced7c91b 100644
    const composerBannerItems = (() => {
      const fallbackSelection = draftFallback?.selection;
      const defaultSelection =
-@@ -2727,7 +2733,10 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2729,7 +2735,10 @@ export default function ChatView(props: ChatViewProps) {
        deriveProviderExtensionStatuses(serverProjection),
      );
      const extensionStatusItems = extensionStatusBanner === null ? [] : [extensionStatusBanner];
@@ -707,7 +707,7 @@ index c96bd47a7a..b9ced7c91b 100644
      const projectCloneItems = projectCloneBannerItem === null ? [] : [projectCloneBannerItem];
      // An approval's feedback goes to that approval; the armed session waits for the next message.
      const freshSessionItems =
-@@ -4051,6 +4060,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -4053,6 +4062,7 @@ export default function ChatView(props: ChatViewProps) {
                      providerInstanceId: activeProviderInstanceId,
                      providers: providerStatuses,
                      sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
