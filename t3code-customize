@@ -809,15 +809,44 @@ def install_mac_agents():
                  'StandardOutPath': str(logs / (command + '.log')), 'StandardErrorPath': str(logs / (command + '.log')),
                  **({'EnvironmentVariables': env} if env else {}), **extra}
         path = mac_agent_plist(label)
-        if path.exists() and plistlib.loads(path.read_bytes()) == plist:
-            continue
-        with path.open('wb') as out:
-            plistlib.dump(plist, out)
+        changed = not (path.exists() and plistlib.loads(path.read_bytes()) == plist)
+        if changed:
+            with path.open('wb') as out:
+                plistlib.dump(plist, out)
         # The login agent waits for the next login; loading it now would bring T3 Code forward.
+        # The watcher must be running after every build, also when its plist did not change.
         if label == MAC_WATCH_AGENT:
-            target = f'gui/{os.getuid()}'
-            subprocess.run(['launchctl', 'bootout', f'{target}/{label}'], check=False, capture_output=True)
-            subprocess.run(['launchctl', 'bootstrap', target, str(path)], check=False, capture_output=True)
+            load_mac_agent(label, path, reload=changed)
+
+
+def mac_agent_loaded(label):
+    return subprocess.run(['launchctl', 'print', f'gui/{os.getuid()}/{label}'],
+                          check=False, capture_output=True).returncode == 0
+
+
+def load_mac_agent(label, path, reload):
+    """Loads an agent, first unloading it when `reload`. Warns when launchd will not take it."""
+    target = f'gui/{os.getuid()}'
+    if reload and mac_agent_loaded(label):
+        subprocess.run(['launchctl', 'bootout', f'{target}/{label}'], check=False, capture_output=True)
+        # bootout returns before the agent is gone, and bootstrap fails until it is.
+        for _ in range(50):
+            if not mac_agent_loaded(label):
+                break
+            time.sleep(0.1)
+    error = ''
+    for _ in range(5):
+        if mac_agent_loaded(label):
+            return
+        result = subprocess.run(['launchctl', 'bootstrap', target, str(path)], check=False,
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        error = (result.stderr or result.stdout).strip()
+        time.sleep(0.5)
+    if not mac_agent_loaded(label):
+        say(f'Warning: could not start {label}: {error or "launchctl refused it"}.\n'
+            f'  T3 Code opened from the Dock stays stock. Run: launchctl bootstrap {target} "{path}"')
 
 
 def remove_mac_agents():
