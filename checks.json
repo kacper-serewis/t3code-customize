@@ -24,7 +24,9 @@
     "apps/web/src/lib/proxyRouting.test.ts",
     "packages/shared/src/themeCss.test.ts",
     "apps/server/src/environmentTheme.test.ts",
-    "apps/web/src/lib/materialIconAlias.test.ts"
+    "apps/web/src/lib/materialIconAlias.test.ts",
+    "apps/server/src/benchmarks/artificialAnalysis.test.ts",
+    "apps/web/src/lib/modelBenchmarks.test.ts"
   ],
   "typecheck": [
     "apps/server",

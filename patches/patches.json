@@ -84,5 +84,12 @@
     "file": "Local-Material-Symbols-Rounded-icons-in-place-of-Luc",
     "title": "Material Symbols Rounded icons in place of Lucide",
     "requires": []
+  },
+  "model-benchmarks": {
+    "file": "Local-show-Artificial-Analysis-benchmark-scores-in-t",
+    "title": "Artificial Analysis scores per model and effort in the model picker",
+    "requires": [
+      "model-picker-usage"
+    ]
   }
 }

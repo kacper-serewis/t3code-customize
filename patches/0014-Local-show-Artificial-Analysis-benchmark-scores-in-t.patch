@@ -1,0 +1,1464 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Tue, 17 Nov 2026 00:15:06 +0100
+Subject: [PATCH 14/14] Local: show Artificial Analysis benchmark scores in the
+ model picker
+
+The server fetches Artificial Analysis's free model list once a day (four
+requests of the 100 a day the free tier allows) and keeps it in
+<stateDir>/artificial-analysis-models.json. The key comes from
+ARTIFICIAL_ANALYSIS_API_KEY or <stateDir>/artificial-analysis-api-key.
+Artificial Analysis lists each effort as its own model, "Claude Opus 5.5
+(High)"; the server folds those rows back into one model with a variant
+per effort and serves them over server.getModelBenchmarks.
+
+- Each model row in the picker shows the model's best Intelligence Index.
+  Hover it for every effort's score, speed, cost per task and price.
+- The effort column prints each level's score with a bar against the
+  model's best level, and the level's speed and cost on hover.
+- A "Scores: Artificial Analysis" link under the levels credits the
+  source, as its terms require.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/server/src/auth/RpcAuthorization.ts      |   2 +
+ .../src/benchmarks/ModelBenchmarkService.ts   | 198 +++++++++++++++++
+ .../src/benchmarks/artificialAnalysis.test.ts | 173 +++++++++++++++
+ .../src/benchmarks/artificialAnalysis.ts      | 201 ++++++++++++++++++
+ .../src/observability/RpcInstrumentation.ts   |   1 +
+ apps/server/src/server.ts                     |   2 +
+ apps/server/src/ws.test.ts                    |   2 +
+ apps/server/src/ws.ts                         |   3 +
+ .../components/chat/ComposerModelEffort.tsx   | 149 +++++++++++--
+ apps/web/src/components/chat/ModelListRow.tsx |  44 ++++
+ .../components/chat/ModelPickerContent.tsx    |   4 +
+ apps/web/src/lib/modelBenchmarks.test.ts      |  92 ++++++++
+ apps/web/src/lib/modelBenchmarks.ts           | 116 ++++++++++
+ apps/web/src/state/modelBenchmarks.ts         |  23 ++
+ packages/client-runtime/src/state/server.ts   |   6 +
+ packages/contracts/src/index.ts               |   1 +
+ packages/contracts/src/modelBenchmarks.ts     |  63 ++++++
+ packages/contracts/src/rpc.ts                 |   9 +
+ 18 files changed, 1069 insertions(+), 20 deletions(-)
+ create mode 100644 apps/server/src/benchmarks/ModelBenchmarkService.ts
+ create mode 100644 apps/server/src/benchmarks/artificialAnalysis.test.ts
+ create mode 100644 apps/server/src/benchmarks/artificialAnalysis.ts
+ create mode 100644 apps/web/src/lib/modelBenchmarks.test.ts
+ create mode 100644 apps/web/src/lib/modelBenchmarks.ts
+ create mode 100644 apps/web/src/state/modelBenchmarks.ts
+ create mode 100644 packages/contracts/src/modelBenchmarks.ts
+
+diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
+index 7925fd8697..ef5c0dd580 100644
+--- a/apps/server/src/auth/RpcAuthorization.ts
++++ b/apps/server/src/auth/RpcAuthorization.ts
+@@ -114,6 +114,8 @@ export const RPC_REQUIRED_SCOPES = {
+   [WS_METHODS.serverRetryResourceTelemetry]: AuthDiagnosticsReadScope,
+   [WS_METHODS.serverGetUsageSummary]: AuthDiagnosticsReadScope,
+   [WS_METHODS.serverRefreshUsageRates]: AuthDiagnosticsReadScope,
++  // Public benchmark scores, shown in the model picker to anyone who can pick a model.
++  [WS_METHODS.serverGetModelBenchmarks]: AuthOrchestrationReadScope,
+   [WS_METHODS.serverSignalProcess]: AuthEnvironmentMaintainScope,
+   [WS_METHODS.serverReportClientActivity]: AuthOrchestrationReadScope,
+   [WS_METHODS.scheduledTasksSubscribe]: AuthOrchestrationReadScope,
+diff --git a/apps/server/src/benchmarks/ModelBenchmarkService.ts b/apps/server/src/benchmarks/ModelBenchmarkService.ts
+new file mode 100644
+index 0000000000..c5df334be0
+--- /dev/null
++++ b/apps/server/src/benchmarks/ModelBenchmarkService.ts
+@@ -0,0 +1,198 @@
++import {
++  MODEL_BENCHMARKS_SOURCE_URL,
++  ModelBenchmark,
++  type ModelBenchmarks,
++} from "@t3tools/contracts";
++import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
++import * as HostProcess from "@t3tools/shared/HostProcess";
++import * as Clock from "effect/Clock";
++import * as Context from "effect/Context";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import * as Semaphore from "effect/Semaphore";
++import { HttpClient } from "effect/http";
++
++import * as ServerConfig from "../config.ts";
++import {
++  ARTIFICIAL_ANALYSIS_MODELS_URL,
++  groupModelBenchmarks,
++  parseArtificialAnalysisPage,
++  type ArtificialAnalysisPage,
++  type ArtificialAnalysisRow,
++} from "./artificialAnalysis.ts";
++
++/** The key comes from this variable, or else from this file in the state directory. */
++export const ARTIFICIAL_ANALYSIS_KEY_ENV = "ARTIFICIAL_ANALYSIS_API_KEY";
++export const ARTIFICIAL_ANALYSIS_KEY_FILE = "artificial-analysis-api-key";
++const CACHE_FILE = "artificial-analysis-models.json";
++
++// The free tier allows 100 requests a day and a full list is a few pages, so fetch daily.
++const TTL_MS = 24 * 60 * 60 * 1000;
++// A refused key or an outage waits this long before the next try.
++const RETRY_AFTER_FAILURE_MS = 60 * 60 * 1000;
++const MAX_PAGES = 10;
++
++const CacheFile = Schema.Struct({
++  fetchedAtMs: Schema.Number,
++  intelligenceIndexVersion: Schema.NullOr(Schema.Number),
++  models: Schema.Array(ModelBenchmark),
++});
++type PageResult =
++  | { readonly ok: true; readonly page: ArtificialAnalysisPage }
++  | { readonly ok: false; readonly status: number | null };
++
++const decodeCache = Schema.decodeUnknownEffect(Schema.fromJsonString(CacheFile));
++const encodeCache = Schema.encodeEffect(Schema.fromJsonString(CacheFile));
++
++export class ModelBenchmarkService extends Context.Service<
++  ModelBenchmarkService,
++  {
++    /** The scores, fetching them first when older than a day. Never fails. */
++    readonly read: Effect.Effect<ModelBenchmarks>;
++  }
++>()("t3/benchmarks/ModelBenchmarkService") {}
++
++export function describeFetchFailure(status: number | null): string {
++  if (status === 401 || status === 403) return "Artificial Analysis refused the API key.";
++  if (status === 429) return "The daily Artificial Analysis request limit is used up.";
++  return "Could not reach Artificial Analysis.";
++}
++
++export const make = Effect.gen(function* () {
++  const fileSystem = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const config = yield* ServerConfig.ServerConfig;
++  const httpClient = yield* HttpClient.HttpClient;
++  const hostEnvironment = yield* HostProcess.Environment;
++  const keyPath = path.join(config.stateDir, ARTIFICIAL_ANALYSIS_KEY_FILE);
++  const cachePath = path.join(config.stateDir, CACHE_FILE);
++  const lock = yield* Semaphore.make(1);
++
++  let models: ModelBenchmarks["models"] = [];
++  let intelligenceIndexVersion: number | null = null;
++  let fetchedAtMs: number | null = null;
++  let lastFailedAtMs: number | null = null;
++  let failure: string | null = null;
++  let configured = false;
++
++  // Read on every refresh, so a key added later needs no restart.
++  const readKey = Effect.gen(function* () {
++    const fromEnv = hostEnvironment[ARTIFICIAL_ANALYSIS_KEY_ENV]?.trim();
++    if (fromEnv) return fromEnv;
++    const fromFile = yield* fileSystem.readFileString(keyPath).pipe(Effect.option);
++    return Option.isSome(fromFile) ? fromFile.value.trim() : "";
++  });
++
++  const loadCache = yield* Effect.cached(
++    fileSystem.readFileString(cachePath).pipe(
++      Effect.flatMap((raw) => decodeCache(raw)),
++      Effect.map((saved) => {
++        models = saved.models;
++        intelligenceIndexVersion = saved.intelligenceIndexVersion;
++        fetchedAtMs = saved.fetchedAtMs;
++      }),
++      Effect.ignoreCause,
++    ),
++  );
++
++  const fetchPage = (key: string, page: number): Effect.Effect<PageResult> =>
++    httpClient
++      .get(`${ARTIFICIAL_ANALYSIS_MODELS_URL}?page=${page}`, {
++        headers: { accept: "application/json", "x-api-key": key },
++      })
++      .pipe(
++        Effect.flatMap((response): Effect.Effect<PageResult, unknown> =>
++          response.status >= 200 && response.status < 300
++            ? response.json.pipe(
++                Effect.map((document) => ({
++                  ok: true as const,
++                  page: parseArtificialAnalysisPage(document),
++                })),
++              )
++            : Effect.succeed({ ok: false as const, status: response.status }),
++        ),
++        Effect.timeout(15_000),
++        Effect.catchCause(() => Effect.succeed({ ok: false as const, status: null })),
++      );
++
++  const fetchAll = Effect.fn("ModelBenchmarkService.fetchAll")(function* (key: string) {
++    const rows: ArtificialAnalysisRow[] = [];
++    let version: number | null = null;
++    for (let page = 1; page <= MAX_PAGES; page++) {
++      const result = yield* fetchPage(key, page);
++      if (!result.ok) return { ok: false as const, status: result.status };
++      rows.push(...result.page.rows);
++      version ??= result.page.intelligenceIndexVersion;
++      if (!result.page.hasMore) break;
++    }
++    return { ok: true as const, rows, version };
++  });
++
++  const refresh = Effect.fn("ModelBenchmarkService.refresh")(function* () {
++    yield* loadCache;
++    const key = yield* readKey;
++    configured = key.length > 0;
++    if (!configured) return;
++    const now = yield* Clock.currentTimeMillis;
++    if (fetchedAtMs !== null && now - fetchedAtMs < TTL_MS) return;
++    if (lastFailedAtMs !== null && now - lastFailedAtMs < RETRY_AFTER_FAILURE_MS) return;
++
++    const result = yield* fetchAll(key);
++    const grouped = result.ok ? groupModelBenchmarks(result.rows) : [];
++    if (!result.ok || grouped.length === 0) {
++      lastFailedAtMs = now;
++      failure = describeFetchFailure(result.ok ? null : result.status);
++      yield* Effect.logWarning("Could not fetch model benchmarks.", { failure });
++      return;
++    }
++    models = grouped;
++    intelligenceIndexVersion = result.version;
++    fetchedAtMs = now;
++    lastFailedAtMs = null;
++    failure = null;
++    yield* encodeCache({ fetchedAtMs: now, intelligenceIndexVersion, models }).pipe(
++      Effect.flatMap((contents) =>
++        writeFileStringAtomically({ filePath: cachePath, contents }).pipe(
++          Effect.provideService(FileSystem.FileSystem, fileSystem),
++          Effect.provideService(Path.Path, path),
++        ),
++      ),
++      Effect.ignoreCause,
++    );
++  });
++
++  const snapshot = (now: number): ModelBenchmarks => {
++    const fresh = fetchedAtMs !== null && now - fetchedAtMs < TTL_MS && failure === null;
++    return {
++      status: !configured
++        ? models.length > 0
++          ? "cached"
++          : "unconfigured"
++        : models.length === 0
++          ? "unavailable"
++          : fresh
++            ? "fresh"
++            : "cached",
++      source: MODEL_BENCHMARKS_SOURCE_URL,
++      fetchedAt: fetchedAtMs === null ? null : DateTime.formatIso(DateTime.makeUnsafe(fetchedAtMs)),
++      intelligenceIndexVersion,
++      message: !configured
++        ? `Add a free Artificial Analysis API key to ${keyPath} or set ${ARTIFICIAL_ANALYSIS_KEY_ENV}.`
++        : failure,
++      models,
++    };
++  };
++
++  const read = lock
++    .withPermit(refresh())
++    .pipe(Effect.ignoreCause, Effect.andThen(Clock.currentTimeMillis), Effect.map(snapshot));
++
++  return { read } as const;
++});
++
++export const layer = Layer.effect(ModelBenchmarkService, make);
+diff --git a/apps/server/src/benchmarks/artificialAnalysis.test.ts b/apps/server/src/benchmarks/artificialAnalysis.test.ts
+new file mode 100644
+index 0000000000..5a97d07c24
+--- /dev/null
++++ b/apps/server/src/benchmarks/artificialAnalysis.test.ts
+@@ -0,0 +1,173 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  groupModelBenchmarks,
++  parseArtificialAnalysisPage,
++  splitVariantName,
++} from "./artificialAnalysis.ts";
++import { describeFetchFailure } from "./ModelBenchmarkService.ts";
++
++function apiRow(
++  name: string,
++  slug: string,
++  index: number | null,
++  tokensPerSecond: number | null = 100,
++  creator = "Anthropic",
++) {
++  return {
++    id: slug,
++    name,
++    slug,
++    release_date: "2026-09-28",
++    model_creator: { id: creator, name: creator },
++    evaluations: {
++      artificial_analysis_intelligence_index: index,
++      artificial_analysis_coding_index: null,
++      artificial_analysis_agentic_index: null,
++    },
++    artificial_analysis_intelligence_index_cost:
++      index === null ? null : { total_cost: 1000, cost_per_task: { total_cost: index / 10 } },
++    pricing: { price_1m_input_tokens: 4, price_1m_output_tokens: 20 },
++    performance: { median_output_tokens_per_second: 1, median_time_to_first_token_seconds: 9 },
++    performance_v3:
++      tokensPerSecond === null
++        ? null
++        : { mean_output_tokens_per_second: tokensPerSecond, mean_time_to_first_token_seconds: 2.5 },
++  };
++}
++
++describe("parseArtificialAnalysisPage", () => {
++  it("reads rows, pagination and the index version, preferring v3 performance", () => {
++    const page = parseArtificialAnalysisPage({
++      tier: "free",
++      intelligence_index_version: 5,
++      pagination: { page: 1, page_size: 200, total_pages: 2, has_more: true },
++      data: [apiRow("Claude Opus 5.5 (High, Default Fallback)", "claude-opus-5-5-high", 51.8)],
++    });
++    expect(page.hasMore).toBe(true);
++    expect(page.intelligenceIndexVersion).toBe(5);
++    expect(page.rows).toEqual([
++      {
++        slug: "claude-opus-5-5-high",
++        name: "Claude Opus 5.5 (High, Default Fallback)",
++        creator: "Anthropic",
++        intelligenceIndex: 51.8,
++        outputTokensPerSecond: 100,
++        timeToFirstTokenSeconds: 2.5,
++        costPerTaskUsd: 5.18,
++        inputPricePerMillionTokens: 4,
++        outputPricePerMillionTokens: 20,
++      },
++    ]);
++  });
++
++  it("falls back to legacy performance and skips rows without a name or slug", () => {
++    const page = parseArtificialAnalysisPage({
++      pagination: { has_more: false },
++      data: [apiRow("Old (Low)", "old-low", null, null), { slug: "nameless" }, null],
++    });
++    expect(page.hasMore).toBe(false);
++    expect(page.rows.map((row) => [row.slug, row.outputTokensPerSecond])).toEqual([["old-low", 1]]);
++  });
++
++  it("tolerates a body that is not the expected shape", () => {
++    expect(parseArtificialAnalysisPage("nope")).toEqual({
++      rows: [],
++      hasMore: false,
++      intelligenceIndexVersion: null,
++    });
++  });
++});
++
++describe("splitVariantName", () => {
++  it("reads the effort and drops fallback notes", () => {
++    expect(splitVariantName("Claude Opus 5.5 (Xhigh, Default Fallback)")).toEqual({
++      base: "Claude Opus 5.5",
++      effort: "xhigh",
++      qualifiers: [],
++    });
++    expect(splitVariantName("Claude Fable 5 (Max, Opus 4.8 Fallback)").effort).toBe("max");
++  });
++
++  it("maps non-reasoning to none and keeps other qualifiers", () => {
++    expect(splitVariantName("GPT-6 Luna (Non-reasoning)").effort).toBe("none");
++    expect(splitVariantName("Claude Sonnet 5 (Non-reasoning, High)").effort).toBe("none");
++    expect(splitVariantName("GPT-6 Sol (Daybreak Blue, max)")).toEqual({
++      base: "GPT-6 Sol",
++      effort: "max",
++      qualifiers: ["Daybreak Blue"],
++    });
++    expect(splitVariantName("GPT-5.5 Instant (June 2026)")).toEqual({
++      base: "GPT-5.5 Instant",
++      effort: null,
++      qualifiers: ["June 2026"],
++    });
++    expect(splitVariantName("Claude 3.5 Haiku")).toEqual({
++      base: "Claude 3.5 Haiku",
++      effort: null,
++      qualifiers: [],
++    });
++  });
++});
++
++describe("groupModelBenchmarks", () => {
++  const rows = parseArtificialAnalysisPage({
++    data: [
++      apiRow("Claude Opus 5.5 (Max, Default Fallback)", "claude-opus-5-5", 59.1),
++      apiRow("Claude Opus 5.5 (Low, Default Fallback)", "claude-opus-5-5-low", 34.8),
++      apiRow("Claude Opus 5.5 (Xhigh, Default Fallback)", "claude-opus-5-5-xhigh", 57.4),
++      apiRow("Claude Opus 5.5 (High, Default Fallback)", "claude-opus-5-5-high", 51.8),
++      apiRow("Claude Opus 5.5 (Medium, Default Fallback)", "claude-opus-5-5-medium", 48.2),
++      // The default effort carries the bare slug, whichever effort it is.
++      apiRow("Gemini 4 Hydrogen (Xhigh)", "gemini-4-hydrogen", 53.9, 173, "Google"),
++      apiRow("Gemini 4 Hydrogen (Low)", "gemini-4-hydrogen-low", 26.9, 166, "Google"),
++      apiRow("GPT-6 Sol (Daybreak Blue, max)", "gpt-6-sol-daybreak-blue", null, 90, "OpenAI"),
++      apiRow("GPT-6 Sol (Max)", "gpt-6-sol", 44.2, 122, "OpenAI"),
++      {
++        ...apiRow("Claude 3.5 Haiku", "claude-3-5-haiku", null, null),
++        performance: { median_output_tokens_per_second: null },
++      },
++    ],
++  }).rows;
++  const models = groupModelBenchmarks(rows);
++
++  it("folds every effort of a model into one entry, lowest effort first", () => {
++    const opus = models.find((model) => model.slug === "claude-opus-5-5");
++    expect(opus?.name).toBe("Claude Opus 5.5");
++    expect(opus?.creator).toBe("Anthropic");
++    expect(opus?.inputPricePerMillionTokens).toBe(4);
++    expect(opus?.variants.map((variant) => [variant.effort, variant.intelligenceIndex])).toEqual([
++      ["low", 34.8],
++      ["medium", 48.2],
++      ["high", 51.8],
++      ["xhigh", 57.4],
++      ["max", 59.1],
++    ]);
++  });
++
++  it("takes the model's slug from what every effort's slug shortens to", () => {
++    expect(models.find((model) => model.name === "Gemini 4 Hydrogen")?.slug).toBe(
++      "gemini-4-hydrogen",
++    );
++  });
++
++  it("keeps a named edition apart from the model and drops models with nothing measured", () => {
++    expect(models.map((model) => model.slug)).toEqual([
++      "claude-opus-5-5",
++      "gemini-4-hydrogen",
++      "gpt-6-sol",
++      "gpt-6-sol-daybreak-blue",
++    ]);
++    expect(models.find((model) => model.slug === "gpt-6-sol-daybreak-blue")?.name).toBe(
++      "GPT-6 Sol (Daybreak Blue)",
++    );
++  });
++});
++
++describe("describeFetchFailure", () => {
++  it("names a refused key and a spent quota", () => {
++    expect(describeFetchFailure(401)).toMatch(/refused the API key/);
++    expect(describeFetchFailure(429)).toMatch(/limit/);
++    expect(describeFetchFailure(null)).toMatch(/Could not reach/);
++  });
++});
+diff --git a/apps/server/src/benchmarks/artificialAnalysis.ts b/apps/server/src/benchmarks/artificialAnalysis.ts
+new file mode 100644
+index 0000000000..49281b337f
+--- /dev/null
++++ b/apps/server/src/benchmarks/artificialAnalysis.ts
+@@ -0,0 +1,201 @@
++import type { ModelBenchmark, ModelBenchmarkVariant } from "@t3tools/contracts";
++
++/**
++ * Artificial Analysis lists every measured configuration as its own model, with the effort in the
++ * name: "Claude Opus 5.5 (High, Default Fallback)", slug `claude-opus-5-5-high`. The model at its
++ * default effort has the bare slug, `claude-opus-5-5`. These helpers fold those rows back into one
++ * model with a variant per effort.
++ */
++
++export const ARTIFICIAL_ANALYSIS_MODELS_URL =
++  "https://artificialanalysis.ai/api/v2/language/models/free";
++
++/** Effort words in the source's names, as T3's effort option ids. */
++const EFFORT_WORDS: Readonly<Record<string, string>> = {
++  "non-reasoning": "none",
++  minimal: "minimal",
++  low: "low",
++  medium: "medium",
++  high: "high",
++  xhigh: "xhigh",
++  "extra high": "xhigh",
++  max: "max",
++};
++
++/** Lowest to highest, for display order. */
++export const EFFORT_ORDER: ReadonlyArray<string> = [
++  "none",
++  "minimal",
++  "low",
++  "medium",
++  "high",
++  "xhigh",
++  "max",
++];
++
++const SLUG_EFFORT_SUFFIX = /-(?:non-reasoning|minimal|low|medium|high|xhigh|max)$/;
++
++export interface ArtificialAnalysisRow {
++  readonly slug: string;
++  readonly name: string;
++  readonly creator: string | null;
++  readonly intelligenceIndex: number | null;
++  readonly outputTokensPerSecond: number | null;
++  readonly timeToFirstTokenSeconds: number | null;
++  readonly costPerTaskUsd: number | null;
++  readonly inputPricePerMillionTokens: number | null;
++  readonly outputPricePerMillionTokens: number | null;
++}
++
++export interface ArtificialAnalysisPage {
++  readonly rows: ReadonlyArray<ArtificialAnalysisRow>;
++  readonly hasMore: boolean;
++  readonly intelligenceIndexVersion: number | null;
++}
++
++function record(value: unknown): Readonly<Record<string, unknown>> {
++  return typeof value === "object" && value !== null && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : {};
++}
++
++function finite(value: unknown): number | null {
++  return typeof value === "number" && Number.isFinite(value) ? value : null;
++}
++
++function text(value: unknown): string | null {
++  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
++}
++
++function parseRow(value: unknown): ArtificialAnalysisRow | null {
++  const row = record(value);
++  const slug = text(row.slug);
++  const name = text(row.name);
++  if (!slug || !name) return null;
++  const evaluations = record(row.evaluations);
++  // `performance` goes null from December 2026; v3 is its replacement.
++  const v3 = record(row.performance_v3);
++  const legacy = record(row.performance);
++  const pricing = record(row.pricing);
++  return {
++    slug,
++    name,
++    creator: text(record(row.model_creator).name),
++    intelligenceIndex: finite(evaluations.artificial_analysis_intelligence_index),
++    outputTokensPerSecond:
++      finite(v3.mean_output_tokens_per_second) ?? finite(legacy.median_output_tokens_per_second),
++    timeToFirstTokenSeconds:
++      finite(v3.mean_time_to_first_token_seconds) ??
++      finite(legacy.median_time_to_first_token_seconds),
++    costPerTaskUsd: finite(
++      record(record(row.artificial_analysis_intelligence_index_cost).cost_per_task).total_cost,
++    ),
++    inputPricePerMillionTokens: finite(pricing.price_1m_input_tokens),
++    outputPricePerMillionTokens: finite(pricing.price_1m_output_tokens),
++  };
++}
++
++/** One page of `/language/models/free`; rows it cannot read are skipped. */
++export function parseArtificialAnalysisPage(document: unknown): ArtificialAnalysisPage {
++  const body = record(document);
++  const data = Array.isArray(body.data) ? body.data : [];
++  return {
++    rows: data.flatMap((value) => {
++      const row = parseRow(value);
++      return row ? [row] : [];
++    }),
++    hasMore: record(body.pagination).has_more === true,
++    intelligenceIndexVersion: finite(body.intelligence_index_version),
++  };
++}
++
++/**
++ * Splits "Claude Opus 5.5 (High, Default Fallback)" into the model, its effort and what else the
++ * parentheses name. Fallback notes describe how the source ran the model, not a different model.
++ */
++export function splitVariantName(name: string): {
++  readonly base: string;
++  readonly effort: string | null;
++  readonly qualifiers: ReadonlyArray<string>;
++} {
++  const match = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(name);
++  if (!match) return { base: name.trim(), effort: null, qualifiers: [] };
++  let effort: string | null = null;
++  const qualifiers: string[] = [];
++  for (const part of match[2]!.split(",")) {
++    const word = part.trim();
++    if (word.length === 0 || /fallback$/i.test(word)) continue;
++    const mapped = EFFORT_WORDS[word.toLowerCase()];
++    if (mapped !== undefined && effort === null) effort = mapped;
++    else if (mapped === undefined) qualifiers.push(word);
++  }
++  return { base: match[1]!.trim(), effort, qualifiers };
++}
++
++function effortRank(effort: string | null): number {
++  const index = effort === null ? -1 : EFFORT_ORDER.indexOf(effort);
++  return index === -1 ? EFFORT_ORDER.length : index;
++}
++
++/** Folds the per-effort rows into one entry per model, dropping models with nothing measured. */
++export function groupModelBenchmarks(
++  rows: ReadonlyArray<ArtificialAnalysisRow>,
++): ReadonlyArray<ModelBenchmark> {
++  const groups = new Map<
++    string,
++    { name: string; rows: Array<{ row: ArtificialAnalysisRow; effort: string | null }> }
++  >();
++  for (const row of rows) {
++    const { base, effort, qualifiers } = splitVariantName(row.name);
++    const name = qualifiers.length > 0 ? `${base} (${qualifiers.join(", ")})` : base;
++    const key = `${row.creator ?? ""}\u0000${name}`;
++    const group = groups.get(key) ?? { name, rows: [] };
++    group.rows.push({ row, effort });
++    groups.set(key, group);
++  }
++
++  const models: ModelBenchmark[] = [];
++  for (const group of groups.values()) {
++    const measured = group.rows.filter(
++      ({ row }) => row.intelligenceIndex !== null || row.outputTokensPerSecond !== null,
++    );
++    if (measured.length === 0) continue;
++    // The model's own slug is the bare one; every effort's slug shortens to it.
++    const slugCounts = new Map<string, number>();
++    for (const { row } of group.rows) {
++      const slug = row.slug.replace(SLUG_EFFORT_SUFFIX, "");
++      slugCounts.set(slug, (slugCounts.get(slug) ?? 0) + 1);
++    }
++    const slug = [...slugCounts.entries()].toSorted(
++      (a, b) => b[1] - a[1] || a[0].length - b[0].length,
++    )[0]![0];
++    const byEffort = new Map<string, ModelBenchmarkVariant>();
++    for (const { row, effort } of measured) {
++      const variant: ModelBenchmarkVariant = {
++        effort,
++        label: row.name,
++        intelligenceIndex: row.intelligenceIndex,
++        outputTokensPerSecond: row.outputTokensPerSecond,
++        timeToFirstTokenSeconds: row.timeToFirstTokenSeconds,
++        costPerTaskUsd: row.costPerTaskUsd,
++      };
++      const key = effort ?? "";
++      const existing = byEffort.get(key);
++      // Two rows for one effort: keep the one with a score.
++      if (!existing || (existing.intelligenceIndex === null && variant.intelligenceIndex !== null))
++        byEffort.set(key, variant);
++    }
++    const priced = group.rows.find(({ row }) => row.inputPricePerMillionTokens !== null)?.row;
++    models.push({
++      slug,
++      name: group.name,
++      creator: group.rows[0]!.row.creator,
++      inputPricePerMillionTokens: priced?.inputPricePerMillionTokens ?? null,
++      outputPricePerMillionTokens: priced?.outputPricePerMillionTokens ?? null,
++      variants: [...byEffort.values()].toSorted(
++        (a, b) => effortRank(a.effort) - effortRank(b.effort),
++      ),
++    });
++  }
++  return models.toSorted((a, b) => a.slug.localeCompare(b.slug));
++}
+diff --git a/apps/server/src/observability/RpcInstrumentation.ts b/apps/server/src/observability/RpcInstrumentation.ts
+index 4549ee8a33..ea477dd422 100644
+--- a/apps/server/src/observability/RpcInstrumentation.ts
++++ b/apps/server/src/observability/RpcInstrumentation.ts
+@@ -95,6 +95,7 @@ const RPC_AGGREGATES = {
+   [WS_METHODS.serverPrepareTriage]: "server",
+   [WS_METHODS.serverGetUsageSummary]: "server",
+   [WS_METHODS.serverRefreshUsageRates]: "server",
++  [WS_METHODS.serverGetModelBenchmarks]: "server",
+   [WS_METHODS.serverSignalProcess]: "server",
+   [WS_METHODS.serverReportClientActivity]: "server",
+   [WS_METHODS.scheduledTasksSubscribe]: "scheduledTasks",
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 2edd25fb0a..768ed4ea8f 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -209,6 +209,7 @@ import { MuseUsageHome } from "@t3tools/provider-muse/server";
+ import * as CursorAccountReader from "@t3tools/provider-cursor/server/CursorAccountReader";
+ import * as CursorUsageAccounts from "@t3tools/provider-cursor/server/CursorUsageAccounts";
+ import * as UsageService from "./usage/UsageService.ts";
++import * as ModelBenchmarkService from "./benchmarks/ModelBenchmarkService.ts";
+ import * as CodexUsageHistory from "./usage/CodexUsageHistory.ts";
+ import * as RuntimeLayer from "./orchestration-v2/runtimeLayer.ts";
+ import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
+@@ -800,6 +801,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
+ 
+ const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
+   Layer.provideMerge(layerUsage),
++  Layer.provideMerge(ModelBenchmarkService.layer),
+   Layer.provideMerge(layerBackground),
+   Layer.provideMerge(layerResourceDiagnostics),
+   Layer.provideMerge(TraceDiagnostics.layer),
+diff --git a/apps/server/src/ws.test.ts b/apps/server/src/ws.test.ts
+index f8ad4d3229..eb4b9341cd 100644
+--- a/apps/server/src/ws.test.ts
++++ b/apps/server/src/ws.test.ts
+@@ -140,6 +140,7 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
+ import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
+ import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
+ import * as UsageService from "./usage/UsageService.ts";
++import * as ModelBenchmarkService from "./benchmarks/ModelBenchmarkService.ts";
+ import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
+ import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
+ import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
+@@ -882,6 +883,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
+   Layer.mock(ThreadManagement.ThreadManagementService)({}),
+   Layer.mock(ThreadSearch.ThreadSearch)({}),
+   Layer.mock(UsageService.UsageService)({}),
++  Layer.mock(ModelBenchmarkService.ModelBenchmarkService)({}),
+   Layer.mock(VcsProvisioningService.VcsProvisioningService)({}),
+   Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
+   Layer.mock(WorkspaceEntries.WorkspaceEntries)({}),
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 6defac543e..93bab2301f 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -246,6 +246,7 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
+ import { commandFeatureUsage, featureUsage } from "./telemetry/FeatureUsage.ts";
+ import type { TelemetryOwner } from "./telemetry/Identify.ts";
+ import * as UsageService from "./usage/UsageService.ts";
++import * as ModelBenchmarkService from "./benchmarks/ModelBenchmarkService.ts";
+ import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+ import * as TriageService from "./triage/TriageService.ts";
+ import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+@@ -1500,6 +1501,7 @@ export const layerWsRpc = (
+               Effect.orElseSucceed(() => null),
+             );
+       const usage = yield* UsageService.UsageService;
++      const modelBenchmarks = yield* ModelBenchmarkService.ModelBenchmarkService;
+       const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
+       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+       const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
+@@ -2701,6 +2703,7 @@ export const layerWsRpc = (
+           resourceTelemetry.readHistory(input),
+         [WS_METHODS.serverGetUsageSummary]: (input) => usage.readSummary(input),
+         [WS_METHODS.serverRefreshUsageRates]: (_input) => usage.refreshRates,
++        [WS_METHODS.serverGetModelBenchmarks]: (_input) => modelBenchmarks.read,
+         [WS_METHODS.serverRetryResourceTelemetry]: (_input) => resourceTelemetry.retry,
+         [WS_METHODS.serverCheckOtlpEndpoint]: (input) => otlpEndpointCheck.check(input),
+         [WS_METHODS.serverListTextGeneratorModels]: (input) => textGenerators.listModels(input),
+diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
+index f56997ff2a..b4a4be23f2 100644
+--- a/apps/web/src/components/chat/ComposerModelEffort.tsx
++++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
+@@ -4,13 +4,29 @@ import {
+   isReasoningControl,
+   selectableProviderOptionChoices,
+ } from "@t3tools/client-runtime/model-traits";
+-import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
++import {
++  MODEL_BENCHMARKS_SOURCE_NAME,
++  MODEL_BENCHMARKS_SOURCE_URL,
++  type ModelBenchmark,
++  type ModelBenchmarks,
++  type ProviderOptionDescriptor,
++  type RuntimeMode,
++} from "@t3tools/contracts";
+ import type { EffortDisplay } from "@t3tools/contracts/settings";
+ import { getProviderOptionCurrentLabel } from "@t3tools/shared/model";
+ import { CheckIcon, ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
+ import { type KeyboardEvent, type ReactNode, use, useRef, useState } from "react";
+ 
++import {
++  benchmarkScoreShare,
++  benchmarkVariantForEffort,
++  describeBenchmarkPrice,
++  describeBenchmarkVariant,
++  findModelBenchmark,
++  formatBenchmarkScore,
++} from "~/lib/modelBenchmarks";
+ import { cn } from "~/lib/utils";
++import { useModelBenchmarks } from "~/state/modelBenchmarks";
+ import {
+   Menu,
+   MenuPopup,
+@@ -189,8 +205,15 @@ function ColumnRow(props: {
+   tabStop: boolean;
+   isDefault?: boolean | undefined;
+   disabled?: boolean;
++  /** The level's Intelligence Index, printed at the end of the row. */
++  score?: string | null | undefined;
++  /** The score against the model's best level, 0 to 1, drawn as a bar under the row. */
++  scoreShare?: number | null | undefined;
++  /** Benchmark lines for the tooltip. */
++  detail?: ReadonlyArray<string> | undefined;
+   onPick: () => void;
+ }) {
++  const tooltip = [props.description, ...(props.detail ?? [])].filter(Boolean);
+   const rowProps = {
+     type: "button",
+     role: "radio",
+@@ -201,12 +224,31 @@ function ColumnRow(props: {
+     "data-effort-level": true,
+     // Up and Down move between rows.
+     tabIndex: props.tabStop ? 0 : -1,
+-    className: COLUMN_ROW,
++    className: cn(COLUMN_ROW, "relative"),
+     onClick: props.onPick,
+   } as const;
+   const content = (
+     <>
+       <span className="min-w-0 flex-1 truncate">{props.label}</span>
++      {props.score ? (
++        <span
++          className="shrink-0 text-muted-foreground/80 text-xs tabular-nums"
++          aria-label={`Intelligence Index ${props.score}`}
++        >
++          {props.score}
++        </span>
++      ) : null}
++      {props.scoreShare != null ? (
++        <span
++          aria-hidden="true"
++          className="pointer-events-none absolute inset-x-2 bottom-0.5 h-px rounded-full bg-foreground/[0.06]"
++        >
++          <span
++            className="block h-full rounded-full bg-muted-foreground/45"
++            style={{ width: `${Math.round(props.scoreShare * 100)}%` }}
++          />
++        </span>
++      ) : null}
+       {props.selected ? (
+         <>
+           {props.isDefault ? <span className="sr-only">Default</span> : null}
+@@ -217,12 +259,16 @@ function ColumnRow(props: {
+       ) : null}
+     </>
+   );
+-  if (!props.description) return <button {...rowProps}>{content}</button>;
++  if (tooltip.length === 0) return <button {...rowProps}>{content}</button>;
+   return (
+     <Tooltip>
+       <TooltipTrigger render={<button {...rowProps} />}>{content}</TooltipTrigger>
+       <TooltipPopup side="right" className="max-w-56">
+-        {props.description}
++        {tooltip.map((line, index) => (
++          <div key={line} className={index === 1 && props.description ? "mt-1" : undefined}>
++            {line}
++          </div>
++        ))}
+       </TooltipPopup>
+     </Tooltip>
+   );
+@@ -245,7 +291,7 @@ function moveBetweenRows(event: KeyboardEvent<HTMLElement>) {
+   next.scrollIntoView({ block: "nearest" });
+ }
+ 
+-function EffortLevels(props: { traits: TraitsSelectionInput }) {
++function EffortLevels(props: { traits: TraitsSelectionInput; benchmark: ModelBenchmark | null }) {
+   const traits = useTraitsSelection(props.traits);
+   const { effort, others } = columnControls(traits.selectDescriptors, traits.booleanDescriptors);
+   if (traits.modelIsUnavailable) {
+@@ -269,7 +315,9 @@ function EffortLevels(props: { traits: TraitsSelectionInput }) {
+     effort?.descriptor.id === traits.primarySelectDescriptor?.id && traits.ultrathinkInBodyText;
+   return (
+     <>
+-      {effort ? <EffortRows control={effort} traits={traits} locked={locked} /> : null}
++      {effort ? (
++        <EffortRows control={effort} traits={traits} locked={locked} benchmark={props.benchmark} />
++      ) : null}
+       {others.length > 0 ? (
+         <div
+           className={cn("flex flex-col gap-0.5", effort && "mt-1 border-t border-border/70 pt-1")}
+@@ -299,7 +347,12 @@ function EffortLevels(props: { traits: TraitsSelectionInput }) {
+ 
+ type TraitsSelection = ReturnType<typeof useTraitsSelection>;
+ 
+-function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; locked: boolean }) {
++function EffortRows(props: {
++  control: ColumnControl;
++  traits: TraitsSelection;
++  locked: boolean;
++  benchmark: ModelBenchmark | null;
++}) {
+   const { control, traits } = props;
+   const { descriptor } = control;
+   if (control.kind === "boolean") {
+@@ -329,18 +382,26 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+           {ULTRATHINK_IN_BODY_NOTE}
+         </div>
+       ) : null}
+-      {choices.map((option, index) => (
+-        <ColumnRow
+-          key={option.id}
+-          label={option.label}
+-          selected={option.id === value}
+-          tabStop={shown ? option.id === value : index === 0}
+-          description={option.description}
+-          isDefault={option.isDefault}
+-          disabled={locked}
+-          onPick={() => traits.changeSelect(control.descriptor, option.id)}
+-        />
+-      ))}
++      {choices.map((option, index) => {
++        const variant = props.benchmark
++          ? benchmarkVariantForEffort(props.benchmark, option.id)
++          : null;
++        return (
++          <ColumnRow
++            key={option.id}
++            label={option.label}
++            selected={option.id === value}
++            tabStop={shown ? option.id === value : index === 0}
++            description={option.description}
++            isDefault={option.isDefault}
++            disabled={locked}
++            score={variant ? formatBenchmarkScore(variant.intelligenceIndex) : null}
++            scoreShare={props.benchmark ? benchmarkScoreShare(props.benchmark, variant) : null}
++            detail={variant ? describeBenchmarkVariant(variant) : undefined}
++            onPick={() => traits.changeSelect(control.descriptor, option.id)}
++          />
++        );
++      })}
+     </div>
+   );
+ }
+@@ -492,6 +553,11 @@ function NoEffortRow() {
+ /** The model picker's effort column: the selected model's levels and its other options. */
+ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | null }) {
+   const picker = use(DockedPickerContext);
++  const benchmarks = useModelBenchmarks();
++  const benchmark =
++    props.traits?.model && benchmarks
++      ? findModelBenchmark(benchmarks.models, props.traits.model)
++      : null;
+   const visibility = props.traits ? getTraitsSectionVisibility(props.traits) : null;
+   const controls =
+     props.traits && visibility
+@@ -516,12 +582,55 @@ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | nul
+         // Capture, so Up and Down on an option row move rows instead of opening its menu.
+         onKeyDownCapture={moveBetweenRows}
+       >
+-        {props.traits ? <EffortLevels traits={props.traits} /> : <NoEffortRow />}
++        {props.traits ? (
++          <EffortLevels traits={props.traits} benchmark={benchmark} />
++        ) : (
++          <NoEffortRow />
++        )}
+       </div>
++      {benchmark && benchmarks ? (
++        <BenchmarkAttribution benchmark={benchmark} benchmarks={benchmarks} />
++      ) : null}
+     </>
+   );
+ }
+ 
++/** Names the source under the levels, as its terms ask, with the model's price on hover. */
++function BenchmarkAttribution(props: { benchmark: ModelBenchmark; benchmarks: ModelBenchmarks }) {
++  const price = describeBenchmarkPrice(props.benchmark);
++  const version = props.benchmarks.intelligenceIndexVersion;
++  const lines = [
++    `Artificial Analysis Intelligence Index${version === null ? "" : ` v${version}`} for ${props.benchmark.name}, measured per effort. Higher is better.`,
++    price,
++    props.benchmarks.status === "cached" && props.benchmarks.message
++      ? `Showing saved scores: ${props.benchmarks.message}`
++      : null,
++  ].filter((line): line is string => line !== null);
++  return (
++    <div className="shrink-0 px-4 pb-2">
++      <Tooltip>
++        <TooltipTrigger
++          render={
++            <a
++              href={MODEL_BENCHMARKS_SOURCE_URL}
++              target="_blank"
++              rel="noreferrer noopener"
++              className="text-muted-foreground/70 text-xs underline-offset-2 hover:text-foreground hover:underline"
++            />
++          }
++        >
++          Scores: {MODEL_BENCHMARKS_SOURCE_NAME}
++        </TooltipTrigger>
++        <TooltipPopup side="right" className="max-w-64">
++          {lines.map((line) => (
++            <div key={line}>{line}</div>
++          ))}
++        </TooltipPopup>
++      </Tooltip>
++    </div>
++  );
++}
++
+ const FOOTER_SEGMENT =
+   "flex h-6 cursor-pointer items-center justify-center gap-1 px-2 text-muted-foreground text-xs outline-none first:rounded-l-md last:rounded-r-md hover:text-foreground data-checked:bg-input/72 data-checked:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
+ 
+diff --git a/apps/web/src/components/chat/ModelListRow.tsx b/apps/web/src/components/chat/ModelListRow.tsx
+index 3838eed5d5..1b899547f5 100644
+--- a/apps/web/src/components/chat/ModelListRow.tsx
++++ b/apps/web/src/components/chat/ModelListRow.tsx
+@@ -11,6 +11,47 @@ import { cn } from "~/lib/utils";
+ import { modelPickerModelKey } from "./modelPickerKeys";
+ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+ import type { PickerSubscriptionUsage } from "./ModelPickerUsage.logic";
++import type { ModelBenchmark } from "@t3tools/contracts";
++import {
++  bestBenchmarkVariant,
++  describeBenchmarkEfforts,
++  describeBenchmarkPrice,
++  describeBenchmarkVariant,
++  formatBenchmarkScore,
++} from "~/lib/modelBenchmarks";
++
++/** The model's best Intelligence Index, with every effort's score and its price on hover. */
++function ModelRowBenchmark({ benchmark }: { benchmark: ModelBenchmark }) {
++  const best = bestBenchmarkVariant(benchmark);
++  const score = best ? formatBenchmarkScore(best.intelligenceIndex) : null;
++  if (!best || !score) return null;
++  const efforts = describeBenchmarkEfforts(benchmark);
++  const lines = [
++    `${benchmark.name}: up to ${describeBenchmarkVariant(best).join(" · ")}`,
++    efforts ? `Per effort: ${efforts}` : null,
++    describeBenchmarkPrice(benchmark),
++    "Artificial Analysis Intelligence Index, higher is better",
++  ].filter((line): line is string => line !== null);
++  return (
++    <Tooltip>
++      <TooltipTrigger
++        render={
++          <span
++            className="shrink-0 text-xs font-normal leading-snug tabular-nums text-muted-foreground/70"
++            aria-label={`Intelligence Index up to ${score}`}
++          />
++        }
++      >
++        {score}
++      </TooltipTrigger>
++      <TooltipPopup side="top" align="end" className="max-w-72">
++        {lines.map((line) => (
++          <div key={line}>{line}</div>
++        ))}
++      </TooltipPopup>
++    </Tooltip>
++  );
++}
+ 
+ const USAGE_TIER_TAG = {
+   "use-now": { label: "Use now", className: "text-success" },
+@@ -46,6 +87,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
+   providerAccentColor?: string | undefined;
+   /** The subscription's 5h and weekly limits, shown at the end of the row. */
+   usage?: PickerSubscriptionUsage | undefined;
++  /** Artificial Analysis scores for this model, when it is listed there. */
++  benchmark?: ModelBenchmark | null | undefined;
+   acpRegistryAgentId?: string | undefined;
+   acpRegistryIconUrl?: string | undefined;
+   isFavorite: boolean;
+@@ -127,6 +170,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
+       </div>
+ 
+       <div className="flex shrink-0 items-center gap-1.5">
++        {props.benchmark ? <ModelRowBenchmark benchmark={props.benchmark} /> : null}
+         {props.usage ? <ModelRowUsage usage={props.usage} /> : null}
+         <Tooltip>
+           <TooltipTrigger
+diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
+index 34e988483d..683dd56a91 100644
+--- a/apps/web/src/components/chat/ModelPickerContent.tsx
++++ b/apps/web/src/components/chat/ModelPickerContent.tsx
+@@ -68,6 +68,8 @@ import {
+ import { providerModelKey, sortProviderModelItems } from "../../modelOrdering";
+ import { hasRuntimeModelCatalog } from "../../providerModels";
+ import { pickerUsageByInstance, sortByPickerUsage } from "./ModelPickerUsage.logic";
++import { findModelBenchmark } from "~/lib/modelBenchmarks";
++import { useModelBenchmarks } from "~/state/modelBenchmarks";
+ 
+ type ModelPickerItem = {
+   slug: string;
+@@ -523,6 +525,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+   const entryByInstanceId = new Map(instanceEntries.map((entry) => [entry.instanceId, entry]));
+   // Subscriptions are ordered from "use now" to "do not use yet" by their usage limits.
+   const [openedAtMs] = useState(() => Date.now());
++  const benchmarkModels = useModelBenchmarks()?.models ?? null;
+   const usageByInstance = pickerUsageByInstance(
+     instanceEntries.map((entry) => entry.snapshot),
+     openedAtMs,
+@@ -1064,6 +1067,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+                     providerDisplayName={model.instanceDisplayName}
+                     providerAccentColor={model.instanceAccentColor}
+                     usage={usageByInstance.get(model.instanceId)}
++                    benchmark={findModelBenchmark(benchmarkModels, model.slug)}
+                     acpRegistryAgentId={model.acpRegistryAgentId}
+                     acpRegistryIconUrl={model.acpRegistryIconUrl}
+                     isFavorite={favoritesSet.has(providerModelKey(model.instanceId, model.slug))}
+diff --git a/apps/web/src/lib/modelBenchmarks.test.ts b/apps/web/src/lib/modelBenchmarks.test.ts
+new file mode 100644
+index 0000000000..d889ca30f6
+--- /dev/null
++++ b/apps/web/src/lib/modelBenchmarks.test.ts
+@@ -0,0 +1,92 @@
++import type { ModelBenchmark } from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  benchmarkScoreShare,
++  benchmarkVariantForEffort,
++  bestBenchmarkVariant,
++  describeBenchmarkEfforts,
++  describeBenchmarkPrice,
++  describeBenchmarkVariant,
++  findModelBenchmark,
++  formatBenchmarkScore,
++  normalizeModelSlug,
++} from "./modelBenchmarks";
++
++const variant = (effort: string | null, intelligenceIndex: number | null) => ({
++  effort,
++  label: `Claude Opus 5.5 (${effort})`,
++  intelligenceIndex,
++  outputTokensPerSecond: 106.94,
++  timeToFirstTokenSeconds: 2,
++  costPerTaskUsd: 3.4647,
++});
++
++const opus: ModelBenchmark = {
++  slug: "claude-opus-5-5",
++  name: "Claude Opus 5.5",
++  creator: "Anthropic",
++  inputPricePerMillionTokens: 4,
++  outputPricePerMillionTokens: 20,
++  variants: [variant("low", 34.8), variant("high", 51.8), variant("max", 59.1)],
++};
++const sol: ModelBenchmark = { ...opus, slug: "gpt-5-6-sol", name: "GPT-5.6 Sol", variants: [] };
++const models = [opus, sol];
++
++describe("normalizeModelSlug", () => {
++  it("brings T3's ids to the source's slugs", () => {
++    expect(normalizeModelSlug("claude-opus-5-5")).toBe("claude-opus-5-5");
++    expect(normalizeModelSlug("gpt-5.6-sol")).toBe("gpt-5-6-sol");
++    expect(normalizeModelSlug("openai/GPT-6-Luna")).toBe("gpt-6-luna");
++    expect(normalizeModelSlug("claude-opus-5-5[1m]")).toBe("claude-opus-5-5");
++    expect(normalizeModelSlug("claude-opus-5-5-20260101")).toBe("claude-opus-5-5");
++    expect(normalizeModelSlug("claude-opus-5-5-latest")).toBe("claude-opus-5-5");
++  });
++});
++
++describe("findModelBenchmark", () => {
++  it("finds a model by any spelling of its id and nothing for an unknown one", () => {
++    expect(findModelBenchmark(models, "gpt-5.6-sol")).toBe(sol);
++    expect(findModelBenchmark(models, "anthropic/claude-opus-5-5")).toBe(opus);
++    expect(findModelBenchmark(models, "auto")).toBeNull();
++    expect(findModelBenchmark(null, "claude-opus-5-5")).toBeNull();
++  });
++});
++
++describe("benchmarkVariantForEffort", () => {
++  it("matches T3's effort ids and runs Ultrathink as max", () => {
++    expect(benchmarkVariantForEffort(opus, "high")?.intelligenceIndex).toBe(51.8);
++    expect(benchmarkVariantForEffort(opus, "ultrathink")?.intelligenceIndex).toBe(59.1);
++    expect(benchmarkVariantForEffort(opus, "medium")).toBeNull();
++    expect(benchmarkVariantForEffort(opus, null)).toBeNull();
++  });
++});
++
++describe("bestBenchmarkVariant and benchmarkScoreShare", () => {
++  it("picks the top score and sizes others against it", () => {
++    expect(bestBenchmarkVariant(opus)?.effort).toBe("max");
++    expect(bestBenchmarkVariant(sol)).toBeNull();
++    expect(benchmarkScoreShare(opus, opus.variants[1]!)).toBeCloseTo(51.8 / 59.1);
++    expect(benchmarkScoreShare(sol, null)).toBeNull();
++  });
++});
++
++describe("descriptions", () => {
++  it("formats scores, measurements, efforts and price", () => {
++    expect(formatBenchmarkScore(59.1)).toBe("59.1");
++    expect(formatBenchmarkScore(48)).toBe("48");
++    expect(formatBenchmarkScore(null)).toBeNull();
++    expect(describeBenchmarkVariant(opus.variants[1]!)).toEqual([
++      "Intelligence 51.8",
++      "107 tok/s",
++      "$3.46 per task",
++    ]);
++    expect(describeBenchmarkVariant({ ...variant("low", null), costPerTaskUsd: 0.0438 })).toEqual([
++      "No Intelligence Index yet",
++      "107 tok/s",
++      "$0.044 per task",
++    ]);
++    expect(describeBenchmarkEfforts(opus)).toBe("Low: 34.8 · High: 51.8 · Max: 59.1");
++    expect(describeBenchmarkPrice(opus)).toBe("$4 in / $20 out per 1M tokens");
++  });
++});
+diff --git a/apps/web/src/lib/modelBenchmarks.ts b/apps/web/src/lib/modelBenchmarks.ts
+new file mode 100644
+index 0000000000..9a8ca829d8
+--- /dev/null
++++ b/apps/web/src/lib/modelBenchmarks.ts
+@@ -0,0 +1,116 @@
++import type { ModelBenchmark, ModelBenchmarkVariant } from "@t3tools/contracts";
++
++/**
++ * Matches T3's model ids to Artificial Analysis entries and words what the picker shows. T3 ids
++ * come as `claude-opus-5-5`, `gpt-5.6-sol`, `openai/gpt-6-luna`, `claude-opus-5-5-20260101` or
++ * `claude-opus-5-5[1m]`; the source uses `claude-opus-5-5`, `gpt-5-6-sol` and `gpt-6-luna`.
++ */
++export function normalizeModelSlug(slug: string): string {
++  return (slug.split("/").at(-1) ?? slug)
++    .trim()
++    .toLowerCase()
++    .replace(/\[[^\]]*\]$/, "")
++    .replace(/[._\s]+/g, "-")
++    .replace(/-(?:latest|\d{8})$/, "");
++}
++
++const indexes = new WeakMap<ReadonlyArray<ModelBenchmark>, ReadonlyMap<string, ModelBenchmark>>();
++
++function indexBySlug(models: ReadonlyArray<ModelBenchmark>): ReadonlyMap<string, ModelBenchmark> {
++  let index = indexes.get(models);
++  if (!index) {
++    index = new Map(models.map((model) => [model.slug, model]));
++    indexes.set(models, index);
++  }
++  return index;
++}
++
++export function findModelBenchmark(
++  models: ReadonlyArray<ModelBenchmark> | null | undefined,
++  slug: string,
++): ModelBenchmark | null {
++  if (!models || models.length === 0) return null;
++  return indexBySlug(models).get(normalizeModelSlug(slug)) ?? null;
++}
++
++/** The variant for one effort option id; `ultrathink` and `ultracode` run at the top level. */
++export function benchmarkVariantForEffort(
++  model: ModelBenchmark,
++  effort: string | null | undefined,
++): ModelBenchmarkVariant | null {
++  if (!effort) return null;
++  const id = effort.toLowerCase();
++  const wanted = id === "ultrathink" ? "max" : id === "extra-high" ? "xhigh" : id;
++  return model.variants.find((variant) => variant.effort === wanted) ?? null;
++}
++
++/** The highest-scoring variant, for a model row that shows one number. */
++export function bestBenchmarkVariant(model: ModelBenchmark): ModelBenchmarkVariant | null {
++  let best: ModelBenchmarkVariant | null = null;
++  for (const variant of model.variants) {
++    if (variant.intelligenceIndex === null) continue;
++    if (!best || variant.intelligenceIndex > (best.intelligenceIndex ?? -Infinity)) best = variant;
++  }
++  return best;
++}
++
++export function formatBenchmarkScore(score: number | null): string | null {
++  return score === null ? null : score.toFixed(score >= 100 ? 0 : 1).replace(/\.0$/, "");
++}
++
++const EFFORT_NAMES: Readonly<Record<string, string>> = {
++  none: "No reasoning",
++  minimal: "Minimal",
++  low: "Low",
++  medium: "Medium",
++  high: "High",
++  xhigh: "Extra High",
++  max: "Max",
++};
++
++function money(value: number): string {
++  return value >= 1 ? `$${value.toFixed(2)}` : `$${value.toFixed(value >= 0.1 ? 2 : 3)}`;
++}
++
++/** One variant's measurements as short phrases, best first. */
++export function describeBenchmarkVariant(variant: ModelBenchmarkVariant): ReadonlyArray<string> {
++  const score = formatBenchmarkScore(variant.intelligenceIndex);
++  return [
++    score === null ? "No Intelligence Index yet" : `Intelligence ${score}`,
++    variant.outputTokensPerSecond === null
++      ? null
++      : `${Math.round(variant.outputTokensPerSecond)} tok/s`,
++    variant.costPerTaskUsd === null ? null : `${money(variant.costPerTaskUsd)} per task`,
++  ].filter((part): part is string => part !== null);
++}
++
++/** Every measured effort, lowest first, as "High: 51.8". */
++export function describeBenchmarkEfforts(model: ModelBenchmark): string {
++  return model.variants
++    .filter((variant) => variant.intelligenceIndex !== null)
++    .map(
++      (variant) =>
++        `${variant.effort ? (EFFORT_NAMES[variant.effort] ?? variant.effort) : "Default"}: ${formatBenchmarkScore(variant.intelligenceIndex)}`,
++    )
++    .join(" · ");
++}
++
++export function describeBenchmarkPrice(model: ModelBenchmark): string | null {
++  const { inputPricePerMillionTokens: input, outputPricePerMillionTokens: output } = model;
++  if (input === null || output === null) return null;
++  return `$${input} in / $${output} out per 1M tokens`;
++}
++
++/**
++ * How a score sits among the model's own efforts, 0 to 1, for a bar. Relative to the model's
++ * best, so the levels compare at a glance.
++ */
++export function benchmarkScoreShare(
++  model: ModelBenchmark,
++  variant: ModelBenchmarkVariant | null,
++): number | null {
++  const best = bestBenchmarkVariant(model)?.intelligenceIndex ?? null;
++  const score = variant?.intelligenceIndex ?? null;
++  if (best === null || score === null || best <= 0) return null;
++  return Math.max(0, Math.min(1, score / best));
++}
+diff --git a/apps/web/src/state/modelBenchmarks.ts b/apps/web/src/state/modelBenchmarks.ts
+new file mode 100644
+index 0000000000..fb5a981100
+--- /dev/null
++++ b/apps/web/src/state/modelBenchmarks.ts
+@@ -0,0 +1,23 @@
++import { useAtomValue } from "@effect/atom-react";
++import type { ModelBenchmarks } from "@t3tools/contracts";
++import { AsyncResult, Atom } from "effect/reactivity";
++
++import { environmentSummaries } from "./presentation";
++import { primaryEnvironmentIdAtom } from "./primaryEnvironment";
++import { serverEnvironment } from "./server";
++
++/**
++ * Benchmark scores from the local server, which holds the Artificial Analysis key. Without a
++ * local server, the first connected one answers. Null until loaded or when no server has them.
++ */
++export const modelBenchmarksAtom = Atom.make((get): ModelBenchmarks | null => {
++  const primary = get(primaryEnvironmentIdAtom);
++  const environmentId = primary ?? get(environmentSummaries.connectedEnvironmentIdsAtom)[0];
++  if (environmentId === undefined) return null;
++  const result = get(serverEnvironment.modelBenchmarks({ environmentId, input: {} }));
++  return AsyncResult.getOrElse(result, () => null);
++}).pipe(Atom.withLabel("web-model-benchmarks"));
++
++export function useModelBenchmarks(): ModelBenchmarks | null {
++  return useAtomValue(modelBenchmarksAtom);
++}
+diff --git a/packages/client-runtime/src/state/server.ts b/packages/client-runtime/src/state/server.ts
+index cbc4de0bea..0ef23b90ef 100644
+--- a/packages/client-runtime/src/state/server.ts
++++ b/packages/client-runtime/src/state/server.ts
+@@ -1467,6 +1467,12 @@ export function createServerEnvironmentAtoms<R, E>(
+       label: "environment-data:server:trace-diagnostics",
+       tag: WS_METHODS.serverGetTraceDiagnostics,
+     }),
++    // Public benchmark scores; the server refetches them once a day.
++    modelBenchmarks: createEnvironmentRpcQueryAtomFamily(runtime, {
++      label: "environment-data:server:model-benchmarks",
++      tag: WS_METHODS.serverGetModelBenchmarks,
++      staleTimeMs: 60 * 60_000,
++    }),
+     npmRelease: createEnvironmentRpcQueryAtomFamily(runtime, {
+       label: "environment-data:server:npm-release",
+       tag: WS_METHODS.serverGetNpmRelease,
+diff --git a/packages/contracts/src/index.ts b/packages/contracts/src/index.ts
+index 8dd47df33a..64b4120e59 100644
+--- a/packages/contracts/src/index.ts
++++ b/packages/contracts/src/index.ts
+@@ -64,6 +64,7 @@ export * from "./preview.ts";
+ export * from "./previewAutomation.ts";
+ export * from "./previewCapture.ts";
+ export * from "./usage.ts";
++export * from "./modelBenchmarks.ts";
+ export * from "./scheduledTask.ts";
+ export * from "./worktreeMcp.ts";
+ export * from "./resourceTelemetry.ts";
+diff --git a/packages/contracts/src/modelBenchmarks.ts b/packages/contracts/src/modelBenchmarks.ts
+new file mode 100644
+index 0000000000..af9d59d1a1
+--- /dev/null
++++ b/packages/contracts/src/modelBenchmarks.ts
+@@ -0,0 +1,63 @@
++import * as Schema from "effect/Schema";
++
++/**
++ * Benchmark results per model and reasoning effort, from Artificial Analysis
++ * (artificialanalysis.ai). Its data may only be shown with attribution.
++ */
++export const MODEL_BENCHMARKS_SOURCE_URL = "https://artificialanalysis.ai/";
++export const MODEL_BENCHMARKS_SOURCE_NAME = "Artificial Analysis";
++
++/** One measured configuration of a model, such as "Claude Opus 5.5 (High)". */
++export const ModelBenchmarkVariant = Schema.Struct({
++  /**
++   * The effort as T3 names its levels: `low`, `medium`, `high`, `xhigh`, `max`, `minimal` or
++   * `none` (non-reasoning). Null when the source names no effort.
++   */
++  effort: Schema.NullOr(Schema.String),
++  /** The source's own name for this configuration. */
++  label: Schema.String,
++  /** Artificial Analysis Intelligence Index; higher is better. Null when not evaluated. */
++  intelligenceIndex: Schema.NullOr(Schema.Number),
++  outputTokensPerSecond: Schema.NullOr(Schema.Number),
++  timeToFirstTokenSeconds: Schema.NullOr(Schema.Number),
++  /** What one task of the Intelligence Index cost to run, in USD. */
++  costPerTaskUsd: Schema.NullOr(Schema.Number),
++});
++export type ModelBenchmarkVariant = typeof ModelBenchmarkVariant.Type;
++
++/** A model with every effort the source measured it at. */
++export const ModelBenchmark = Schema.Struct({
++  /** The source's slug for the model at its default effort, such as `claude-opus-5-5`. */
++  slug: Schema.String,
++  /** The model name without the effort, such as "Claude Opus 5.5". */
++  name: Schema.String,
++  creator: Schema.NullOr(Schema.String),
++  inputPricePerMillionTokens: Schema.NullOr(Schema.Number),
++  outputPricePerMillionTokens: Schema.NullOr(Schema.Number),
++  variants: Schema.Array(ModelBenchmarkVariant),
++});
++export type ModelBenchmark = typeof ModelBenchmark.Type;
++
++export const ModelBenchmarksStatus = Schema.Literals([
++  /** Fetched within the last day. */
++  "fresh",
++  /** Older data kept because the last fetch failed. */
++  "cached",
++  /** No API key is set up. */
++  "unconfigured",
++  /** Nothing to show: the fetch failed and nothing was cached. */
++  "unavailable",
++]);
++export type ModelBenchmarksStatus = typeof ModelBenchmarksStatus.Type;
++
++export const ModelBenchmarks = Schema.Struct({
++  status: ModelBenchmarksStatus,
++  source: Schema.String,
++  fetchedAt: Schema.NullOr(Schema.String),
++  /** The Intelligence Index version the scores belong to, such as 5. */
++  intelligenceIndexVersion: Schema.NullOr(Schema.Number),
++  /** Why there is no fresh data, for a tooltip. */
++  message: Schema.NullOr(Schema.String),
++  models: Schema.Array(ModelBenchmark),
++});
++export type ModelBenchmarks = typeof ModelBenchmarks.Type;
+diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
+index e1d392cd08..9aed8677b3 100644
+--- a/packages/contracts/src/rpc.ts
++++ b/packages/contracts/src/rpc.ts
+@@ -357,6 +357,7 @@ import {
+   ProviderConsumeResetCreditResult,
+ } from "./providerUsageLimits.ts";
+ import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
++import { ModelBenchmarks } from "./modelBenchmarks.ts";
+ import {
+   StorageCleanupReport,
+   DatabaseReclaimError,
+@@ -551,6 +552,7 @@ export const WS_METHODS = {
+   serverReportClientActivity: "server.reportClientActivity",
+   serverGetUsageSummary: "server.getUsageSummary",
+   serverRefreshUsageRates: "server.refreshUsageRates",
++  serverGetModelBenchmarks: "server.getModelBenchmarks",
+ 
+   scheduledTasksSubscribe: "scheduledTasks.subscribe",
+   scheduledTasksUpsert: "scheduledTasks.upsert",
+@@ -1034,6 +1036,12 @@ const WsServerRefreshUsageRatesRpc = Rpc.make(WS_METHODS.serverRefreshUsageRates
+   error: EnvironmentAuthorizationError,
+ });
+ 
++const WsServerGetModelBenchmarksRpc = Rpc.make(WS_METHODS.serverGetModelBenchmarks, {
++  payload: Schema.Struct({}),
++  success: ModelBenchmarks,
++  error: EnvironmentAuthorizationError,
++});
++
+ const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess, {
+   payload: ServerSignalProcessInput,
+   success: ServerSignalProcessResult,
+@@ -2171,6 +2179,7 @@ export const WsRpcGroup = RpcGroup.make(
+   WsServerPrepareTriageRpc,
+   WsServerGetUsageSummaryRpc,
+   WsServerRefreshUsageRatesRpc,
++  WsServerGetModelBenchmarksRpc,
+   WsServerSignalProcessRpc,
+   WsScheduledTasksSubscribeRpc,
+   WsScheduledTasksUpsertRpc,

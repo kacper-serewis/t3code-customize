@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sat, 14 Nov 2026 13:45:35 +0100
-Subject: [PATCH 12/13] Local: let theme CSS name images in the themes
+Subject: [PATCH 12/14] Local: let theme CSS name images in the themes
  directory
 
 Theme CSS may hold 20,000 characters, so an embedded background image has

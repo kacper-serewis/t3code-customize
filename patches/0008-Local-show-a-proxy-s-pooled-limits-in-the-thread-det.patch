@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:22:06 +0100
-Subject: [PATCH 08/13] Local: show a proxy's pooled limits in the thread
+Subject: [PATCH 08/14] Local: show a proxy's pooled limits in the thread
  details card
 
 A Claude instance that talks to a custom endpoint (a CLI proxy) cannot read

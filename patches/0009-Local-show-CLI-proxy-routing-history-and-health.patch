@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:37:37 +0100
-Subject: [PATCH 09/13] Local: show CLI proxy routing, history and health
+Subject: [PATCH 09/14] Local: show CLI proxy routing, history and health
 
 A CLIProxyAPI fork serves routing, quota-history and fork-status endpoints beside
 the stock management API. The server now reads them with each source refresh
