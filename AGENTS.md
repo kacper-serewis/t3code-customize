@@ -10,13 +10,13 @@ is to carry them onto the user's nightly with every feature still working.
 
 1. Run `./t3code-customize build` from this repo. It finds the installed T3 Code (AppImage or macOS app),
    reads the exact upstream commit it was built from, and applies the patches to
-   that commit in the source checkout at `~/.cache/t3code-customize/t3code`.
+   that commit in the source checkout at `~/.local/share/t3code-customize/source`.
 2. If it reports a conflict, a rebase is stopped in that checkout. If it reports a
    failing test or typecheck, the commits are in place and the checks failed.
 
 ## Fix
 
-Work only in `~/.cache/t3code-customize/t3code` and this repo.
+Work only in `~/.local/share/t3code-customize/source` and this repo.
 
 - Conflicts: resolve each file, `git add` it, then `GIT_EDITOR=true git rebase --continue`.
   Keep upstream's change and port the patch on top of it. When upstream moved or split
@@ -25,9 +25,17 @@ Work only in `~/.cache/t3code-customize/t3code` and this repo.
   `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <nightly commit>`. Keep one
   commit per patch.
 - If a test file moved upstream, update its path in `checks.json`.
+- The user can turn patches off (`t3code-customize patches`). The checkout then holds
+  only the patches that are on; port those and do not add the others back.
 - `git log <base>..<nightly commit>` and `git show` explain what changed upstream.
 - To install dependencies, use exactly `pnpm install --frozen-lockfile --ignore-scripts`
   in the source checkout, the same as the tool.
+
+`patches/patches.json` names each patch (by its file name without the number), gives it
+a title and lists the earlier patches it `requires`. Keep the commit subjects as they are,
+so the file names still match. When you add a patch, add an entry. When a patch starts
+building on another one, add that one to its `requires`; `t3code-customize verify` checks
+that each patch applies with only what it requires.
 
 Do not drop a patch, delete or weaken a test, or skip a check to get green. If a
 feature can't be ported sensibly, stop and explain why.

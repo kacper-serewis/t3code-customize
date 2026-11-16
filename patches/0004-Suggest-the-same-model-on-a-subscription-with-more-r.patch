@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:06:07 +0200
-Subject: [PATCH 04/11] Suggest the same model on a subscription with more room
+Subject: [PATCH 04/13] Suggest the same model on a subscription with more room
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -15,19 +15,19 @@ Model-scoped weeklies only count for their own model family. Clicking
 switches the thread through the usual model selection; the tooltip
 explains why and when a started thread cannot switch.
 ---
- apps/web/src/components/ChatView.tsx          |  20 ++
+ apps/web/src/components/ChatView.tsx          |  21 ++
  .../web/src/components/chat/ComposerStats.tsx |  69 ++++++
  .../chat/SubscriptionSwitch.logic.test.ts     | 226 ++++++++++++++++++
  .../chat/SubscriptionSwitch.logic.ts          | 225 +++++++++++++++++
- 4 files changed, 540 insertions(+)
+ 4 files changed, 541 insertions(+)
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index ee10cf66cf4..11684c52d2e 100644
+index 28138edae1..153b897b24 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -224,6 +224,8 @@ import {
+@@ -245,6 +245,8 @@ import {
    type ComposerImageAttachment,
    type DraftThreadEnvMode,
    useComposerDraftStore,
@@ -36,7 +36,7 @@ index ee10cf66cf4..11684c52d2e 100644
    DraftId,
  } from "../composerDraftStore";
  import { type TerminalContextDraft } from "../lib/terminalContext";
-@@ -1470,6 +1472,17 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1513,6 +1515,18 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderThread,
    );
    const activeUsageLimits = activeProviderStatus?.usageLimits;
@@ -44,6 +44,7 @@ index ee10cf66cf4..11684c52d2e 100644
 +  const subscriptionSwitchDraft = useComposerDraftModelState(composerDraftTarget);
 +  const { selectedModel: subscriptionSwitchModel } = deriveEffectiveComposerModelState({
 +    draft: subscriptionSwitchDraft,
++    threadStarted: threadHasStarted(activeThread),
 +    providers: providerStatuses,
 +    selectedProvider,
 +    selectedInstanceId: activeProviderInstanceId,
@@ -54,7 +55,7 @@ index ee10cf66cf4..11684c52d2e 100644
    const activeProviderName =
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
-@@ -3921,6 +3934,13 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3932,6 +3946,13 @@ export default function ChatView(props: ChatViewProps) {
                                    : compactDisabledReason
                            }
                            isCompacting={isCompacting}
@@ -69,7 +70,7 @@ index ee10cf66cf4..11684c52d2e 100644
                        )}
                        <div
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index fe42f034996..7d61a0f25eb 100644
+index fe42f03499..7d61a0f25e 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -1,5 +1,7 @@
@@ -191,7 +192,7 @@ index fe42f034996..7d61a0f25eb 100644
            {stats.map(({ key, node }, index) => (
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 new file mode 100644
-index 00000000000..da5f1aa6e43
+index 0000000000..da5f1aa6e4
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 @@ -0,0 +1,226 @@
@@ -423,7 +424,7 @@ index 00000000000..da5f1aa6e43
 +});
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 new file mode 100644
-index 00000000000..af475f0b2aa
+index 0000000000..af475f0b2a
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -0,0 +1,225 @@

@@ -1,8 +1,8 @@
-# T3 Code (Customized) on macOS
+# T3 Code customized on macOS
 
 The patches and the build are the same as on Linux. Only the last step differs: on macOS
-nothing is copied, repacked or re-signed. A launcher opens your own `T3 Code (Nightly).app`
-and loads the rebuilt bundles into it as it starts.
+nothing is copied, repacked or re-signed. Your own `T3 Code (Nightly).app` is started with
+a startup hook that loads the rebuilt bundles into it, and you keep opening it the usual way.
 
 ## Install
 
@@ -15,7 +15,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/btsouth/t3code-customize
 1. The first run downloads T3 Code's source and build tools, so give it 5 to 15 minutes.
    It uses about 6 GB of disk.
 2. Quit T3 Code fully (Cmd+Q, not just closing the window).
-3. Open **T3 Code (Customized)** from Spotlight, Launchpad or `~/Applications`.
+3. Open T3 Code as usual, from the Dock, Spotlight or Finder.
 4. Turn on **Settings > General > Stats for nerds**.
 
 If your app is somewhere else, point to it once:
@@ -29,16 +29,23 @@ t3code-customize --app "/path/to/T3 Code (Nightly).app"
 
 ## Day to day
 
-- Always open T3 Code with **T3 Code (Customized)**. Opening T3 Code from the Dock, Finder
-  or a `t3code://` link starts it stock. You can pin the running app to the Dock as usual;
-  just start it with the launcher.
-- If T3 Code is already running, the launcher only brings it forward. Quit it fully and
-  open the launcher again to get the customization.
+- Open T3 Code however you like. Two login agents in `~/Library/LaunchAgents` take care of
+  the customization:
+  - **At login**, `io.github.btsouth.t3code-customize.login` opens T3 Code with it.
+  - **Any other start**, from the Dock, Finder or a `t3code://` link, is stock at first.
+    `io.github.btsouth.t3code-customize.watch` notices, quits T3 Code and reopens it with
+    the customization. You see a window appear and close once.
+- The watcher leaves alone a T3 Code that was already running when it started, one that
+  does not quit within 20 seconds, and any start while the customization is off or does
+  not match your T3 Code. It reopens at most once a minute, so a failed start cannot loop.
+- To open T3 Code with the customization from a terminal, run `t3code-customize launch`.
+  If T3 Code is already running, it only brings it forward.
 - T3 Code updates itself as usual. After an update, run `t3code-customize` again. Until
-  you do, the launcher opens stock T3 Code and tells you why.
+  you do, T3 Code opens stock and the watcher does nothing.
 
 `t3code-customize status`, `off`, `on` and `uninstall` work as on Linux. `uninstall` also
-removes the launcher from `~/Applications`.
+removes the login agents. Builds before this change installed a **T3 Code (Customized)** app
+in `~/Applications`; the next build removes it.
 
 ## Why it injects instead of rebuilding the app
 
@@ -62,12 +69,13 @@ On Linux, the tool rebuilds the JavaScript, packs it into a copy of the AppImage
 
 Injecting avoids all of that. Your app stays byte for byte as T3 shipped it, signature
 and entitlements included. Keychain, passkeys, updates and links behave exactly as in
-stock. The tool only adds a folder of rebuilt JavaScript and the launcher.
+stock. The tool only adds a folder of rebuilt JavaScript and two login agents.
 
 ## How the injection works
 
-The rebuilt bundles go in `~/.local/share/t3code-customize/current/overlay`. When you open
-the launcher, it:
+The rebuilt bundles go in `~/.local/share/t3code-customize/current/overlay`. When T3 Code is
+opened with the customization (at login, by the watcher or with `t3code-customize launch`),
+the tool:
 
 1. starts your app with `--inspect-brk` on a random local port, so it waits before running
    any of its own code,
@@ -89,13 +97,16 @@ them. Your T3 Code is never modified, so it keeps working either way.
 
 ## Troubleshooting
 
-- **The stats bar is missing.** Make sure T3 Code was fully quit before you opened the
-  launcher, then check that the launcher log ends with `Opened T3 Code with the
-  customization`.
+- **The stats bar is missing.** Check `t3code-customize status`, then the watcher log for
+  the start: `watch.log` should say it reopened T3 Code, and `launch.log` should end with
+  `Opened T3 Code with the customization`. A T3 Code that was already running when the
+  watcher started is left as it is; quit it fully and reopen it.
+- **T3 Code closes once right after you open it.** That is the watcher reopening it with
+  the customization. Run `t3code-customize off` to stop it.
 - **A notification says "Opened stock T3 Code".** It names the reason. Usually T3 Code was
   updated and you need to run `t3code-customize` again.
-- **Logs.** Launcher: `~/.cache/t3code-customize/logs/launch.log`. Builds: the other files
-  in the same folder.
+- **Logs.** Login and launch: `~/.cache/t3code-customize/logs/launch.log`. Watcher:
+  `watch.log`. Builds: the other files in the same folder.
 - **Running it from a terminal inside T3 Code** works. The tool clears the
   `ELECTRON_RUN_AS_NODE` variable that T3 sets for its terminals.
 - **Before reporting a bug to T3 Code**, run `t3code-customize off`, quit T3 Code, reopen

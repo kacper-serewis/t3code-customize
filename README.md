@@ -22,11 +22,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/btsouth/t3code-customize
 
 Or clone it anywhere and run `./t3code-customize`.
 
-The first run downloads T3 Code's source and build tools, so give it 5 to 15 minutes. Then quit T3 Code fully, open **T3 Code (Customized)** from your app launcher and turn on **Settings > General > Stats for nerds**.
+The first run downloads T3 Code's source and build tools, so give it 5 to 15 minutes. Then quit T3 Code fully, reopen it (on Linux: open **T3 Code (Customized)** from your app launcher) and turn on **Settings > General > Stats for nerds**.
 
 You need git and Python 3. If your Node is older than 24, it fetches its own copy. It uses about 6 GB of disk. If your AppImage isn't in `~/Applications` or `~/Downloads`, run it once with `--appimage /path/to/T3-Code.AppImage`.
 
-On macOS, open **T3 Code (Customized)** from Spotlight, Launchpad or `~/Applications`. See the [macOS guide](docs/macos.md) for setup, day-to-day use and why it loads the patches into your app instead of rebuilding it. It looks for `T3 Code (Nightly).app` in `/Applications` and `~/Applications`; point it elsewhere once with `--app "/path/to/T3 Code (Nightly).app"`.
+On macOS, keep opening T3 Code as usual: login agents open it with the customization. See the [macOS guide](docs/macos.md) for setup, day-to-day use and why it loads the patches into your app instead of rebuilding it. It looks for `T3 Code (Nightly).app` in `/Applications` and `~/Applications`; point it elsewhere once with `--app "/path/to/T3 Code (Nightly).app"`.
 
 ## After every T3 Code update
 
@@ -34,7 +34,7 @@ On macOS, open **T3 Code (Customized)** from Spotlight, Launchpad or `~/Applicat
 t3code-customize
 ```
 
-That's it. It pulls the latest patches, rebuilds for your new version and tells you when to reopen. Until you run it, the launcher opens stock T3 Code and tells you why.
+That's it. It pulls the latest patches, rebuilds for your new version and tells you when to reopen. Until you run it, T3 Code opens stock and says why.
 
 ## When a nightly breaks the patches
 
@@ -46,6 +46,20 @@ Upstream moves fast, and sometimes a nightly changes the code the patches touch.
 
 Your current T3 Code keeps working the whole time.
 
+## Choosing patches
+
+Every patch is on by default. To leave some out, run `t3code-customize patches`. It lists them and asks which to toggle, then offers to rebuild. Or name them directly:
+
+```sh
+t3code-customize patches off stats material-icons   # by id
+t3code-customize patches on 11                      # or by number
+t3code-customize patches on --all
+```
+
+Some patches build on others. Turning one on also turns on what it needs, and turning one off also turns off what needs it. Your choice is kept in `~/.config/t3code-customize/config.json` and applies to every later build. New patches start out on.
+
+This also helps when a nightly breaks one patch: turn it off and build the rest without waiting for a port. A port made while some patches are off is not saved to `patches/`, because it only covers part of the set.
+
 ## How it works
 
 T3 Code is open source (MIT). This repo holds four patches and one script. The script:
@@ -55,7 +69,7 @@ T3 Code is open source (MIT). This repo holds four patches and one script. The s
 3. rebuilds the web, server and desktop JavaScript,
 4. on Linux, lays it over a copy of your app, keeping every native part as shipped, and checks the result byte for byte.
 
-On macOS nothing is copied or re-signed, so your app keeps its signature, keychain access, passkeys and updates. The launcher opens your own `T3 Code (Nightly).app` with a startup hook, loads the rebuilt bundles into it before any app code runs, and closes the hook again. Opening T3 Code any other way gives you stock.
+On macOS nothing is copied or re-signed, so your app keeps its signature, keychain access, passkeys and updates. A login agent opens your own `T3 Code (Nightly).app` with a startup hook, loads the rebuilt bundles into it before any app code runs, and closes the hook again. Started any other way, it opens stock and a second agent reopens it with the customization.
 
 Everything runs on your machine. Your app and your T3 data are never modified.
 
@@ -65,15 +79,16 @@ Everything runs on your machine. Your app and your T3 data are never modified.
 t3code-customize             update the patches and build for your installed T3 Code
 t3code-customize status      show what the next launch opens
 t3code-customize off | on    switch between stock and the customized build
-t3code-customize uninstall   remove it, its launcher, builds and caches
+t3code-customize patches     list the patches and pick which ones to build
+t3code-customize uninstall   remove it, its launcher or login agents, builds and caches
 ```
 
 ## Good to know
 
 - **Bugs:** before reporting anything to T3 Code, run `t3code-customize off`, reopen and check it happens on stock too. Report customization problems here.
 - **Windows:** not supported yet. The patches are platform independent; only the packaging differs. Your agent can adapt it, and PRs are welcome.
-- **macOS:** the customization applies when T3 Code starts from the launcher. If T3 Code is already running, the launcher just brings it forward. It relies on T3 Code allowing a startup hook (`--inspect-brk`); if a release turns that off, the build stops and says so.
-- **Files:** builds live in `~/.local/share/t3code-customize`, the source checkout and logs in `~/.cache/t3code-customize`.
+- **macOS:** opening T3 Code from the Dock or Finder starts it stock for a moment; the watcher quits it and reopens it with the customization. It relies on T3 Code allowing a startup hook (`--inspect-brk`); if a release turns that off, the build stops and says so.
+- **Files:** builds and the source checkout live in `~/.local/share/t3code-customize`, logs in `~/.cache/t3code-customize`.
 
 ## License
 

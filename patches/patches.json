@@ -1,0 +1,88 @@
+{
+  "stats": {
+    "file": "Stats-for-Nerds-response-throughput-and-the-composer",
+    "title": "Stats bar under the composer: usage, context, tokens per second, cache rate",
+    "requires": [
+      "usage-polling"
+    ]
+  },
+  "usage-polling": {
+    "file": "Usage-limits-background-polling-reset-aware-merging-",
+    "title": "Usage limits polled in the background, merged across resets",
+    "requires": [
+      "stats"
+    ]
+  },
+  "compaction": {
+    "file": "fix-web-show-compaction-settings-and-add-a-stats-com",
+    "title": "Compaction threshold and a Compact now button in the stats bar",
+    "requires": [
+      "stats"
+    ]
+  },
+  "subscription-switch": {
+    "file": "Suggest-the-same-model-on-a-subscription-with-more-r",
+    "title": "Suggest the same model on a subscription with more room",
+    "requires": [
+      "compaction"
+    ]
+  },
+  "subscription-standings": {
+    "file": "Local-show-the-current-model-s-standing-on-each-subs",
+    "title": "Each subscription's standing in the limits popover",
+    "requires": [
+      "subscription-switch"
+    ]
+  },
+  "model-picker-usage": {
+    "file": "Local-order-the-model-picker-by-subscription-usage-a",
+    "title": "Model picker ordered by subscription usage, with 5h/weekly limits",
+    "requires": [
+      "subscription-standings"
+    ]
+  },
+  "usage-feed": {
+    "file": "Local-serve-usage-limits-as-a-JSON-feed-for-desktop-",
+    "title": "Usage limits as a JSON feed for desktop widgets",
+    "requires": [
+      "usage-polling"
+    ]
+  },
+  "proxy-limits": {
+    "file": "Local-show-a-proxy-s-pooled-limits-in-the-thread-det",
+    "title": "A proxy's pooled limits in the thread details card",
+    "requires": [
+      "usage-polling"
+    ]
+  },
+  "proxy-routing": {
+    "file": "Local-show-CLI-proxy-routing-history-and-health",
+    "title": "CLI proxy routing, history and health",
+    "requires": [
+      "subscription-switch",
+      "proxy-limits"
+    ]
+  },
+  "proxy-forecasts": {
+    "file": "Local-proxy-forecasts-subagents-and-panel-link",
+    "title": "Proxy forecasts, subagents and panel link",
+    "requires": [
+      "proxy-routing"
+    ]
+  },
+  "sidebar-drag": {
+    "file": "Local-drag-the-window-from-empty-sidebar-space",
+    "title": "Drag the window from empty sidebar space",
+    "requires": []
+  },
+  "theme-images": {
+    "file": "Local-let-theme-CSS-name-images-in-the-themes-direct",
+    "title": "Theme CSS can use image files from the themes folder",
+    "requires": []
+  },
+  "material-icons": {
+    "file": "Local-Material-Symbols-Rounded-icons-in-place-of-Luc",
+    "title": "Material Symbols Rounded icons in place of Lucide",
+    "requires": []
+  }
+}

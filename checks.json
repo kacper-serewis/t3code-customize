@@ -21,7 +21,10 @@
     "apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts",
     "apps/server/src/usage/cliproxyObservability.test.ts",
     "apps/web/src/components/usage/proxyObservability.test.ts",
-    "apps/web/src/lib/proxyRouting.test.ts"
+    "apps/web/src/lib/proxyRouting.test.ts",
+    "packages/shared/src/themeCss.test.ts",
+    "apps/server/src/environmentTheme.test.ts",
+    "apps/web/src/lib/materialIconAlias.test.ts"
   ],
   "typecheck": [
     "apps/server",
@@ -31,6 +34,7 @@
     "packages/provider-core",
     "packages/provider-cursor",
     "packages/provider-grok",
-    "packages/provider-opencode"
+    "packages/provider-opencode",
+    "packages/shared"
   ]
 }

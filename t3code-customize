@@ -34,7 +34,9 @@ SHARE = Path(os.environ.get('XDG_DATA_HOME') or HOME / '.local/share')
 DATA = SHARE / NAME
 CACHE = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / NAME
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config') / NAME
-SOURCE = CACHE / 't3code'
+# Not under a .cache folder: upstream's test config excludes **/.cache/**, which would hide every test.
+SOURCE = DATA / 'source'
+OLD_SOURCE = CACHE / 't3code'
 STATE = DATA / 'state.json'
 CURRENT = DATA / 'current'
 DISABLED = DATA / 'disabled'
@@ -47,6 +49,11 @@ MAC_SEARCH = [Path('/Applications'), HOME / 'Applications']
 MAC_APP = 'T3 Code (Nightly).app'
 MAC_LAUNCHER = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
 MAC_BUNDLE_ID = 'com.t3tools.t3code'
+MAC_AGENTS = HOME / 'Library/LaunchAgents'
+# Opens T3 Code with the customization at login.
+MAC_LOGIN_AGENT = 'io.github.btsouth.t3code-customize.login'
+# Reopens a T3 Code that was started some other way (Dock, Finder, a link) with the customization.
+MAC_WATCH_AGENT = 'io.github.btsouth.t3code-customize.watch'
 ARCH = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}
 AGENTS = {
     'claude': ['claude', '-p', '--dangerously-skip-permissions'],
@@ -67,9 +74,9 @@ PUBLIC_CONFIG = {
 }
 # Never prompts (it may run without a terminal) and keeps node_modules consistent between runs.
 PNPM_INSTALL = ['--frozen-lockfile', '--ignore-scripts', '--config.confirmModulesPurge=false']
-# Strings that only exist in bundles built with the patches.
-MARKERS = (('apps/server/dist/client/', b'statsForNerds'), ('apps/server/dist/', b'claude_observed'),
-           ('apps/desktop/dist-electron/', b'statsForNerds'))
+# Strings that only exist in bundles built with a patch, by patch id.
+MARKERS = {'stats': (('apps/server/dist/client/', b'statsForNerds'), ('apps/server/dist/', b'claude_observed'),
+                     ('apps/desktop/dist-electron/', b'statsForNerds'))}
 
 
 class Stop(Exception):
@@ -126,10 +133,59 @@ def patches():
     return sorted((REPO / 'patches').glob('*.patch'))
 
 
+def catalog():
+    """Every patch in order, with the id, title and requirements patches/patches.json gives it."""
+    manifest = load(REPO / 'patches/patches.json', {})
+    by_file = {info['file']: (pid, info) for pid, info in manifest.items()}
+    entries = []
+    for path in patches():
+        # format-patch names each file NNNN-<subject>; the subject part survives a port.
+        slug = re.sub(r'^\d+-', '', path.stem)
+        pid, info = by_file.get(slug, (slug, {}))
+        entries.append({'id': pid, 'path': path, 'title': info.get('title', slug),
+                        'requires': info.get('requires', []), 'listed': slug in by_file})
+    return entries
+
+
+def switched_off():
+    """Patch ids the user turned off with `patches off`."""
+    return set(load(CONFIG / 'config.json', {}).get('disabledPatches', []))
+
+
+def selection(entries=None, off=None):
+    """The patches to build: all but those switched off and those that need one that is off."""
+    entries = catalog() if entries is None else entries
+    off = switched_off() if off is None else set(off)
+    dropped = set()
+    for pid in off:
+        dropped |= dependents(entries, pid)
+    return [entry for entry in entries if entry['id'] not in dropped]
+
+
+def requirements(entries, pid):
+    """pid and every patch it needs, directly or through another. Two patches may need each other."""
+    requires = {entry['id']: set(entry['requires']) for entry in entries}
+    needed, todo = set(), [pid]
+    while todo:
+        current = todo.pop()
+        if current not in needed:
+            needed.add(current)
+            todo += requires.get(current, ())
+    return needed
+
+
+def dependents(entries, pid):
+    """pid and every patch that needs it, directly or through another."""
+    return {entry['id'] for entry in entries if pid in requirements(entries, entry['id'])}
+
+
 def recipe_hash():
     digest = hashlib.sha256()
-    for path in patches() + [REPO / 'patches/base.txt', REPO / 'checks.json']:
-        digest.update(path.name.encode() + path.read_bytes())
+    for path in patches() + [REPO / 'patches/base.txt', REPO / 'patches/patches.json', REPO / 'checks.json']:
+        if path.exists():
+            digest.update(path.name.encode() + path.read_bytes())
+    # Turning a patch off or on makes a different build.
+    digest.update(','.join(entry['id'] for entry in selection()).encode())
     return digest.hexdigest()[:12]
 
 
@@ -258,7 +314,7 @@ def read_public_config(archive):
     return {PUBLIC_CONFIG[name]: value for name, value in found.items()}
 
 
-def overlay(stock_path, output, build, config):
+def overlay(stock_path, output, build, config, markers):
     """Write stock_path with the server and desktop bundles replaced by build's, then verify it."""
     stock = Archive(stock_path)
     try:
@@ -321,7 +377,7 @@ def overlay(stock_path, output, build, config):
                         else key in patched.entries and stock.read(key) == patched.read(key))
                 if not same:
                     raise Stop('Archive verification failed for stock entry ' + key)
-            check_bundles(stock, patched, config)
+            check_bundles(stock, patched, config, markers)
         finally:
             patched.close()
     finally:
@@ -340,11 +396,12 @@ class Folder:
                 yield path.relative_to(self.root).as_posix(), path.read_bytes()
 
 
-def check_bundles(stock, patched, config):
+def check_bundles(stock, patched, config, markers):
     """The rebuilt bundles carry the patches and the same T3 Connect config as stock."""
-    for prefix, marker in MARKERS:
-        if not any(marker in data for _, data in patched.scripts(prefix)):
-            raise Stop(f'The rebuilt bundle under {prefix} is missing the stats bar.')
+    for pid in markers:
+        for prefix, marker in MARKERS.get(pid, ()):
+            if not any(marker in data for _, data in patched.scripts(prefix)):
+                raise Stop(f'The rebuilt bundle under {prefix} is missing the {pid} patch.')
     # Connect needs the same public config as stock in every bundle that carries it.
     for prefix in ('apps/server/dist/client/', 'apps/server/dist/', 'apps/desktop/dist-electron/'):
         def contents(archive):
@@ -356,7 +413,7 @@ def check_bundles(stock, patched, config):
                 raise Stop(f'The rebuilt bundle under {prefix} is missing T3 Connect config ({key}).')
 
 
-def assemble_mac(stock_path, output, build, config):
+def assemble_mac(stock_path, output, build, config, markers):
     """Write the rebuilt bundles and the loader to output, then verify them against stock."""
     overlay = output / 'overlay'
     for prefix in ('apps/server/dist', 'apps/desktop/dist-electron'):
@@ -375,7 +432,7 @@ def assemble_mac(stock_path, output, build, config):
         # The app loads boot.cjs before the customization exists, so it must stay as shipped.
         if stock.read('apps/desktop/dist-electron/boot.cjs') != (overlay / 'apps/desktop/dist-electron/boot.cjs').read_bytes():
             raise Stop('The rebuilt boot.cjs differs from your app; the customization cannot load into it.')
-        check_bundles(stock, Folder(overlay), config)
+        check_bundles(stock, Folder(overlay), config, markers)
     finally:
         stock.close()
 
@@ -404,23 +461,33 @@ def node_major(node):
         return 0
 
 
-def ensure_node(log):
+def required_node_major(commit):
+    """The Node major the source pins in package.json engines, at least 24."""
+    try:
+        engines = json.loads(git('show', commit + ':package.json')).get('engines', {}).get('node', '')
+        return max(24, int(re.search(r'\d+', engines).group()))
+    except (subprocess.CalledProcessError, ValueError, AttributeError):
+        return 24
+
+
+def ensure_node(commit, log):
     """Use the system Node if it is new enough, else a private copy from nodejs.org."""
+    major = required_node_major(commit)
     system = shutil.which('node')
-    if system and node_major(system) >= 24:
+    if system and node_major(system) >= major:
         return None
     arch = ARCH.get(os.uname().machine)
     if not arch:
-        raise Stop('Node 24 or newer is required. Install it and run again.')
+        raise Stop(f'Node {major} or newer is required. Install it and run again.')
     # nodejs.org names the macOS builds darwin-* and lists them as osx-*-tar.
     platform, listed = ('darwin', f'osx-{arch}-tar') if MAC else ('linux', f'linux-{arch}')
-    private = sorted((CACHE / 'node').glob(f'node-v24.*-{platform}-{arch}'), key=version_key)
-    if private and node_major(str(private[-1] / 'bin/node')) >= 24:
+    private = sorted((CACHE / 'node').glob(f'node-v{major}.*-{platform}-{arch}'), key=version_key)
+    if private and node_major(str(private[-1] / 'bin/node')) >= major:
         return private[-1] / 'bin'
-    step('Downloading Node 24 (one time, private to this tool)...')
+    step(f'Downloading Node {major} (one time, private to this tool)...')
     with urllib.request.urlopen('https://nodejs.org/dist/index.json', timeout=30) as response:
         releases = json.load(response)
-    version = next(r['version'] for r in releases if r['version'].startswith('v24.') and listed in r['files'])
+    version = next(r['version'] for r in releases if r['version'].startswith(f'v{major}.') and listed in r['files'])
     name = f'node-{version}-{platform}-{arch}'
     base = f'https://nodejs.org/dist/{version}/'
     with urllib.request.urlopen(base + 'SHASUMS256.txt', timeout=30) as response:
@@ -472,6 +539,10 @@ def has_commit(ref):
 
 
 def ensure_commit(commit, version, log):
+    if not (SOURCE / '.git').exists() and (OLD_SOURCE / '.git').exists():
+        # Earlier versions kept the checkout under the cache folder.
+        SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(OLD_SOURCE), SOURCE)
     if not (SOURCE / '.git').exists():
         step('Downloading T3 Code source history (one time)...')
         shutil.rmtree(SOURCE, ignore_errors=True)
@@ -486,20 +557,34 @@ def ensure_commit(commit, version, log):
     return git('rev-parse', commit + '^{commit}').strip()
 
 
-def prepare(target, log, resume=False):
-    """Leave SOURCE with the patches as commits on top of target."""
+def apply_at_base(base, entries, log):
+    """Check out base with entries applied as commits, or stop at the first one that does not apply."""
+    if rebase_in_progress():
+        # Start over from the repo's patches; a fresh build never continues an old port.
+        git('am', '--abort', check=False, capture=False, log=log)
+        git('rebase', '--abort', check=False, capture=False, log=log)
+    git('checkout', '--quiet', '--force', '--detach', base, capture=False, log=log)
+    # Keep node_modules so dependency installs stay fast between builds.
+    git('clean', '-ffdxq', '-e', 'node_modules', capture=False, log=log)
+    for entry in entries:
+        if git('am', '--quiet', '--committer-date-is-author-date', str(entry['path']), check=False, capture=False, log=log).returncode:
+            git('am', '--abort', check=False, capture=False, log=log)
+            return entry
+    return None
+
+
+def prepare(target, log, resume=False, entries=None):
+    """Leave SOURCE with the chosen patches (all by default) as commits on top of target."""
     base = (REPO / 'patches/base.txt').read_text().strip()
+    everything = catalog()
+    entries = everything if entries is None else entries
     if not resume:
-        if rebase_in_progress():
-            # Start over from the repo's patches; a fresh build never continues an old port.
-            git('am', '--abort', check=False, capture=False, log=log)
-            git('rebase', '--abort', check=False, capture=False, log=log)
-        git('checkout', '--quiet', '--force', '--detach', base, capture=False, log=log)
-        # Keep node_modules so dependency installs stay fast between builds.
-        git('clean', '-ffdxq', '-e', 'node_modules', capture=False, log=log)
-        if git('am', '--quiet', '--committer-date-is-author-date', *map(str, patches()), check=False, capture=False, log=log).returncode:
-            git('am', '--abort', check=False, capture=False, log=log)
-            raise Stop(f'The patches do not apply to their own base {base[:12]}. Check git status in {REPO}.')
+        failed = apply_at_base(base, entries, log)
+        if failed and len(entries) < len(everything):
+            raise Stop(f'The {failed["id"]} patch does not apply without the patches that are off. It needs one of them;\n'
+                       f'list it under "requires" in {REPO / "patches/patches.json"}, or turn them back on.')
+        if failed:
+            raise Stop(f'The patches do not apply to their own base {base[:12]} ({failed["path"].name}). Check git status in {REPO}.')
         if base != target:
             git('rebase', '--quiet', '--onto', target, base, check=False, capture=False, log=log)
     if rebase_in_progress():
@@ -518,13 +603,26 @@ def install_dependencies(env, log):
     run([*pnpm(env), 'install', *PNPM_INSTALL], cwd=SOURCE, env=env, log=log)
 
 
-def checks(env, log):
+def created_files(path):
+    """Files a patch adds."""
+    return set(re.findall(r'^diff --git a/\S+ b/(\S+)\nnew file mode', path.read_text(errors='replace'), re.M))
+
+
+def checks(env, log, entries=None):
     spec = json.loads((REPO / 'checks.json').read_text())
-    missing = [t for t in spec['tests'] if not (SOURCE / t).exists()]
+    # Tests that a patch which is off would add are not in the checkout; they have nothing to test.
+    absent = set()
+    if entries is not None:
+        chosen = {entry['id'] for entry in entries}
+        for entry in catalog():
+            if entry['id'] not in chosen:
+                absent |= created_files(entry['path'])
+    tests = [t for t in spec['tests'] if t not in absent]
+    missing = [t for t in tests if not (SOURCE / t).exists()]
     if missing:
         raise NeedsFix('Test files listed in checks.json no longer exist (moved upstream?):\n' + '\n'.join('  ' + t for t in missing))
     step('Testing the patches...')
-    steps = [(['vp', 'test', 'run', *spec['tests']], SOURCE, 'The patch tests failed.')]
+    steps = [(['vp', 'test', 'run', *tests], SOURCE, 'The patch tests failed.')] if tests else []
     # Upstream typechecks each package with the tsrs checker; there is no tsc.
     steps += [(['effect-tsgo', 'tsrs', '--noEmit'], SOURCE / p, f'Typecheck failed in {p}.') for p in spec['typecheck']]
     for args, cwd, message in steps:
@@ -588,10 +686,17 @@ def choose_agent(requested):
     return name if answer in ('', 'y', 'yes') else None
 
 
-def agent_fix(agent, problem, target, version, log):
+def agent_fix(agent, problem, target, version, log, entries):
+    everything = catalog()
+    subset = ''
+    if len(entries) < len(everything):
+        off = [e['path'].name for e in everything if e not in entries]
+        subset = ('The user turned some patches off, so the checkout only has these: '
+                  + ', '.join(e['path'].name for e in entries) + '.\nPort only those. Do not add the ones that are off: '
+                  + ', '.join(off) + '.\n\n')
     prompt = (f'Follow {REPO}/AGENTS.md to port the T3 Code customization patches.\n\n'
               f'Source checkout: {SOURCE}\nNightly: {version} at commit {target}\n'
-              f'Patch repo: {REPO}\n\nThe build stopped with:\n\n{problem}\n\n'
+              f'Patch repo: {REPO}\n\n{subset}The build stopped with:\n\n{problem}\n\n'
               f'When the checks pass, stop. Do not run the build yourself; {NAME} continues it.\n')
     step(f'{AGENT_NAMES[agent]} is porting the patches. Transcript: {log.name}')
     log.write('\n--- agent prompt ---\n' + prompt + '\n')
@@ -652,7 +757,9 @@ def install_launcher(appimage):
         BIN.unlink(missing_ok=True)
         BIN.symlink_to(REPO / NAME)
     if MAC:
-        install_mac_launcher(appimage)
+        # The agents open T3 Code with the customization, so the regular icon is enough.
+        shutil.rmtree(MAC_LAUNCHER, ignore_errors=True)
+        install_mac_agents()
     else:
         install_desktop_entry()
     if str(BIN.parent) not in os.environ.get('PATH', '').split(os.pathsep):
@@ -684,6 +791,39 @@ def install_mac_launcher(app):
     if icon.exists():
         shutil.copy2(icon, contents / 'Resources/icon.icns')
     os.utime(MAC_LAUNCHER, None)
+
+
+def mac_agent_plist(label):
+    return MAC_AGENTS / (label + '.plist')
+
+
+def install_mac_agents():
+    """Login and watch agents, so the regular T3 Code icon opens the customized build."""
+    MAC_AGENTS.mkdir(parents=True, exist_ok=True)
+    logs = CACHE / 'logs'
+    env = {key: os.environ[key] for key in ('XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME') if os.environ.get(key)}
+    for label, command, extra in ((MAC_LOGIN_AGENT, 'launch', {}),
+                                  (MAC_WATCH_AGENT, 'watch', {'KeepAlive': True, 'ThrottleInterval': 30})):
+        plist = {'Label': label, 'ProgramArguments': [sys.executable, str(REPO / NAME), command],
+                 'RunAtLoad': True, 'ProcessType': 'Interactive',
+                 'StandardOutPath': str(logs / (command + '.log')), 'StandardErrorPath': str(logs / (command + '.log')),
+                 **({'EnvironmentVariables': env} if env else {}), **extra}
+        path = mac_agent_plist(label)
+        if path.exists() and plistlib.loads(path.read_bytes()) == plist:
+            continue
+        with path.open('wb') as out:
+            plistlib.dump(plist, out)
+        # The login agent waits for the next login; loading it now would bring T3 Code forward.
+        if label == MAC_WATCH_AGENT:
+            target = f'gui/{os.getuid()}'
+            subprocess.run(['launchctl', 'bootout', f'{target}/{label}'], check=False, capture_output=True)
+            subprocess.run(['launchctl', 'bootstrap', target, str(path)], check=False, capture_output=True)
+
+
+def remove_mac_agents():
+    for label in (MAC_LOGIN_AGENT, MAC_WATCH_AGENT):
+        subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/{label}'], check=False, capture_output=True)
+        mac_agent_plist(label).unlink(missing_ok=True)
 
 
 def install_desktop_entry():
@@ -721,7 +861,7 @@ def cmd_build(args):
     if (not args.force and not args.resume and state.get('stock') == fingerprint(appimage)
             and state.get('recipe') == recipe and built().exists()):
         install_launcher(appimage)
-        say(f'\nAlready up to date. Open "{LAUNCHER_NAME}" from your app launcher.')
+        say('\nAlready up to date. ' + ('Quit T3 Code fully and reopen it.' if MAC else f'Open "{LAUNCHER_NAME}" from your app launcher.'))
         return
     DATA.mkdir(parents=True, exist_ok=True)
     logs = CACHE / 'logs'
@@ -752,29 +892,38 @@ def cmd_build(args):
         say(f'    Nightly {version}, upstream commit {commit[:12]}')
         if len(config) != len(PUBLIC_CONFIG):
             say('    Note: could not read T3 Connect config from your app; sign-in may not work in this build.')
-        node_bin = ensure_node(log)
-        env = build_env(node_bin)
         target = ensure_commit(commit, version, log)
-        step('Applying the patches...')
+        env = build_env(ensure_node(target, log))
+        entries = selection()
+        enabled_ids = [entry['id'] for entry in entries]
+        if not entries:
+            raise Stop(f'Every patch is off, so there is nothing to build. Turn some on with {NAME} patches,\n'
+                       f'or use {NAME} off to open stock T3 Code.')
+        total = len(catalog())
+        step('Applying the patches...' if len(entries) == total else
+             f'Applying {len(entries)} of {total} patches (off: {", ".join(e["id"] for e in catalog() if e["id"] not in enabled_ids)})...')
         attempts = 2
         resume = ported = args.resume
         agent = None
         while True:
             try:
-                prepare(target, log, resume=resume)
+                prepare(target, log, resume=resume, entries=entries)
                 install_dependencies(env, log)
                 if not args.skip_checks:
-                    checks(env, log)
+                    checks(env, log, entries)
                 break
             except NeedsFix as problem:
                 if older_than_patches(target):
                     raise Stop(stuck_message(problem, target))
                 say(str(problem))
+                if len(entries) < total:
+                    say(f'Some patches are off. If this nightly is not the cause, a patch that is on may need one that is off;\n'
+                        f'turn that one back on with {NAME} patches, and list it under "requires" in patches/patches.json.')
                 agent = agent or choose_agent(args.fix)
                 if not agent or attempts == 0:
                     raise NeedsFix(stuck_message(problem, target))
                 attempts -= 1
-                agent_fix(agent, str(problem), target, version, log)
+                agent_fix(agent, str(problem), target, version, log, entries)
                 resume = ported = True
         head = git('rev-parse', 'HEAD').strip()
         build_bundles(env, version, stock_root, config, log)
@@ -783,13 +932,15 @@ def cmd_build(args):
         step('Assembling and verifying your customized app...')
         if MAC:
             assembled = job / 'build'
-            assemble_mac(stock_asar(appimage), assembled, SOURCE, config)
+            assemble_mac(stock_asar(appimage), assembled, SOURCE, config, enabled_ids)
         else:
             output = job / 'app.asar'
-            overlay(stock_root / 'resources/app.asar', output, SOURCE, config)
+            overlay(stock_root / 'resources/app.asar', output, SOURCE, config, enabled_ids)
             shutil.move(str(output), stock_root / 'resources/app.asar')
             assembled = stock_root
-        if ported:
+        # A port of only some patches cannot replace the full set in patches/.
+        saved = ported and len(entries) == total
+        if saved:
             export_patches(target)
         destination = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -800,7 +951,7 @@ def cmd_build(args):
         link.symlink_to(destination.relative_to(DATA))
         os.replace(link, CURRENT)
         save(STATE, {'stock': fingerprint(appimage), 'version': version, 'commit': target, 'recipe': recipe_hash(),
-                     'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
+                     'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG), 'patches': enabled_ids,
                      'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
         icon = destination / 't3code.png'
         if icon.exists():
@@ -809,14 +960,19 @@ def cmd_build(args):
     shutil.rmtree(job, ignore_errors=True)
     install_launcher(appimage)
     minutes = max(1, round((time.time() - started) / 60))
-    say(f'\nDone in {minutes} min: T3 Code {version} with the stats bar.')
-    if ported:
+    say(f'\nDone in {minutes} min: T3 Code {version} with ' +
+        ('the stats bar.' if len(entries) == total else f'{len(entries)} of {total} patches.'))
+    if saved:
         say(f'The ported patches were saved to {REPO / "patches"}.')
+    elif ported:
+        say(f'Some patches are off, so this port was not saved to {REPO / "patches"}.\n'
+            f'To port the full set, turn them all on ({NAME} patches on --all) and run {NAME} again.')
     if DISABLED.exists():
         say(f'Customization is switched off. Run {NAME} on to use it.')
     else:
-        say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from your app launcher.')
-        say('First time? Turn on Settings > General > Stats for nerds.')
+        say('Quit T3 Code fully and reopen it.' if MAC else f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from your app launcher.')
+        if 'stats' in enabled_ids:
+            say('First time? Turn on Settings > General > Stats for nerds.')
 
 
 def export_patches(target):
@@ -837,6 +993,24 @@ def prune(keep=3):
             shutil.rmtree(old, ignore_errors=True)
 
 
+def verify_manifest(base, log):
+    """Every patch is in patches.json, and applies to base with only the patches it requires."""
+    step('Checking that each patch applies with only what it requires...')
+    entries = catalog()
+    ids = [entry['id'] for entry in entries]
+    problems = [f'{e["path"].name} is not listed in patches/patches.json.' for e in entries if not e['listed']]
+    problems += [f'{e["id"]} requires {r}, which is not another patch.'
+                 for e in entries for r in e['requires'] if r not in ids or r == e['id']]
+    if problems:
+        raise Stop('\n'.join(problems))
+    for entry in entries:
+        # Everything this patch is not, and does not require, is off.
+        failed = apply_at_base(base, selection(entries, set(ids) - requirements(entries, entry['id'])), log)
+        if failed:
+            raise Stop(f'{entry["id"]} does not apply with only what it requires ({failed["id"]} failed).\n'
+                       f'Add what it builds on to its "requires" in patches/patches.json.')
+
+
 def cmd_verify(args):
     """Apply the patches to their base and run the checks. No AppImage needed (used by CI)."""
     logs = CACHE / 'logs'
@@ -844,8 +1018,9 @@ def cmd_verify(args):
     base = (REPO / 'patches/base.txt').read_text().strip()
     with (logs / ('verify-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w') as log:
         say('Log: ' + log.name)
-        env = build_env(ensure_node(log))
         target = ensure_commit(base, None, log)
+        env = build_env(ensure_node(target, log))
+        verify_manifest(base, log)
         prepare(target, log)
         install_dependencies(env, log)
         checks(env, log)
@@ -903,6 +1078,61 @@ def launch_mac(app, target, rest):
         say(f'Opened T3 Code with the customization from {target}.')
 
 
+def mac_main_processes(binary):
+    """PIDs of T3 Code main processes, and whether each one started with the customization hook."""
+    out = subprocess.run(['ps', '-axo', 'pid=,ppid=,args='], capture_output=True, text=True).stdout
+    found = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        # The main process is started by launchd; the backend and helpers are its children.
+        if len(parts) == 3 and parts[1] == '1' and parts[2].startswith(str(binary)):
+            found[int(parts[0])] = '--inspect-brk' in parts[2][len(str(binary)):]
+    return found
+
+
+def mac_quit_and_wait(timeout=20):
+    subprocess.run(['osascript', '-e', f'tell application id "{MAC_BUNDLE_ID}" to quit'], check=False, capture_output=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not mac_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def cmd_watch(args):
+    """Reopens T3 Code with the customization when something starts it stock."""
+    if not MAC:
+        raise Stop('watch is for macOS.')
+    app = find_app()
+    binary = mac_binary(app)
+    # Instances already running when the watcher starts are left alone, so loading it never quits T3 Code.
+    seen = set(mac_main_processes(binary))
+    quiet_until = 0.0
+    say(time.strftime('%Y-%m-%d %H:%M:%S') + ' Watching for T3 Code started without the customization.')
+    while True:
+        time.sleep(1)
+        for pid, hooked in mac_main_processes(binary).items():
+            if pid in seen:
+                continue
+            seen.add(pid)
+            target, notice = launch_target()
+            # Only when the customization is on and current, and never twice in a row, so a failed
+            # relaunch that opens stock does not loop.
+            if hooked or target == app or notice or time.time() < quiet_until:
+                continue
+            quiet_until = time.time() + 60
+            say(time.strftime('%Y-%m-%d %H:%M:%S') + f' T3 Code {pid} started stock; reopening it with the customization.')
+            # Give it a moment to finish starting, so the quit request is received.
+            time.sleep(1.5)
+            if not mac_quit_and_wait():
+                say('T3 Code did not quit; leaving it running stock.')
+                continue
+            launch_mac(app, target, [])
+        if not mac_running():
+            seen.clear()
+
+
 def cmd_launch(args):
     appimage = find_app()
     target, notice = launch_target()
@@ -925,8 +1155,87 @@ def cmd_status(args):
     say('Customized build:   ' + (f"{state['version']} (built {state['builtAt']})" if state else 'none yet'))
     say('Switched:           ' + ('off' if DISABLED.exists() else 'on'))
     say('Next launch opens:  ' + ('customized build' if target != appimage else 'stock T3 Code'))
+    entries, chosen = catalog(), [entry['id'] for entry in selection()]
+    off = [entry['id'] for entry in entries if entry['id'] not in chosen]
+    say(f'Patches:            {len(chosen)} of {len(entries)} on' + (f' (off: {", ".join(off)})' if off else ''))
     if notice:
         say(notice)
+    elif state and state.get('patches', chosen) != chosen:
+        say(f'The patch selection changed since the last build. Run {NAME} to rebuild with it.')
+
+
+def cmd_patches(args):
+    """List the patches, or turn some on or off for the next build."""
+    entries = catalog()
+    ids = [entry['id'] for entry in entries]
+
+    def resolve(names):
+        found = []
+        for name in names:
+            if name.isdigit() and 1 <= int(name) <= len(ids):
+                found.append(ids[int(name) - 1])
+            elif name in ids:
+                found.append(name)
+            else:
+                raise Stop(f'No patch "{name}". Run {NAME} patches to list them.')
+        return found
+
+    off = switched_off() & set(ids)
+    before = [entry['id'] for entry in selection(entries, off)]
+
+    def change(action, names):
+        nonlocal off
+        for pid in resolve(names):
+            if action == 'on':
+                extra = requirements(entries, pid) & off - {pid}
+                off -= requirements(entries, pid)
+            else:
+                extra = dependents(entries, pid) - off - {pid}
+                off |= dependents(entries, pid)
+            if extra:
+                say(f'{pid} {"needs" if action == "on" else "is needed by"} {", ".join(sorted(extra))}; '
+                    f'turned {"that" if len(extra) == 1 else "those"} {action} too.')
+
+    if args.action == 'on' and args.all:
+        off = set()
+    elif args.action in ('on', 'off'):
+        if not args.names:
+            raise Stop(f'Name the patches to turn {args.action}, by id or number. Run {NAME} patches to list them.')
+        change(args.action, args.names)
+
+    def show():
+        chosen = {entry['id'] for entry in selection(entries, off)}
+        width = max(map(len, ids))
+        for number, entry in enumerate(entries, 1):
+            needs = f'  (needs {", ".join(entry["requires"])})' if entry['requires'] else ''
+            say(f'  {number:2} [{"x" if entry["id"] in chosen else " "}] {entry["id"]:<{width}}  {entry["title"]}{needs}')
+
+    show()
+    if args.action is None and interactive():
+        while True:
+            answer = input('\nToggle patches (numbers or ids, separated by spaces; Enter when done): ').split()
+            if not answer:
+                break
+            try:
+                for pid in resolve(answer):
+                    on_now = pid in {entry['id'] for entry in selection(entries, off)}
+                    change('off' if on_now else 'on', [pid])
+            except Stop as problem:
+                say(str(problem))
+                continue
+            say()
+            show()
+    after = [entry['id'] for entry in selection(entries, off)]
+    save(CONFIG / 'config.json', {**load(CONFIG / 'config.json', {}), 'disabledPatches': sorted(off)})
+    if after == before:
+        return
+    if not after:
+        say(f'\nEvery patch is off. Use {NAME} off to open stock T3 Code instead.')
+        return
+    if args.action is None and interactive():
+        if input('\nRebuild now with this selection? [Y/n] ').strip().lower() in ('', 'y', 'yes'):
+            os.execv(sys.executable, [sys.executable, str(REPO / NAME), 'build'])
+    say(f'\nRun {NAME} to rebuild with this selection.')
 
 
 def cmd_on(args):
@@ -945,6 +1254,8 @@ def cmd_uninstall(args):
         BIN.unlink()
     DESKTOP.unlink(missing_ok=True)
     shutil.rmtree(MAC_LAUNCHER, ignore_errors=True)
+    if MAC:
+        remove_mac_agents()
     for folder in (DATA, CACHE, CONFIG):
         shutil.rmtree(folder, ignore_errors=True)
     tail = '' if DATA in REPO.parents else f' You can delete {REPO} too.'
@@ -970,14 +1281,22 @@ def main():
     sub.add_parser('status', help='show what the next launch opens')
     sub.add_parser('on', help='use the customized build')
     sub.add_parser('off', help='go back to stock T3 Code')
+    chooser = sub.add_parser('patches', help='list the patches and turn single ones on or off',
+                             description='List the patches, or pick which ones the next build includes. Without arguments in a '
+                                         'terminal, it asks which to toggle. Turning one on also turns on what it needs; '
+                                         'turning one off also turns off what needs it.')
+    chooser.add_argument('action', nargs='?', choices=('on', 'off'), help='turn the named patches on or off')
+    chooser.add_argument('names', nargs='*', help='patch ids or numbers, as the list shows them')
+    chooser.add_argument('--all', action='store_true', help='with on: turn every patch on')
     sub.add_parser('verify', help='apply the patches to their base and run the checks (for CI)')
     sub.add_parser('uninstall', help='remove the launcher, builds and caches')
+    sub.add_parser('watch', help='macOS: reopen T3 Code with the customization when it starts stock (run by a login agent)')
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
         argv = ['build', *argv]
     args = parser.parse_args(argv)
     handler = globals()['cmd_' + args.command]
-    if args.command in ('launch', 'status', 'on', 'off'):
+    if args.command in ('launch', 'status', 'on', 'off', 'watch', 'patches'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
     with (CACHE / 'lock').open('w') as lock:

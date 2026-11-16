@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Fri, 6 Nov 2026 11:15:48 +0100
-Subject: [PATCH 11/11] Local: drag the window from empty sidebar space
+Subject: [PATCH 11/13] Local: drag the window from empty sidebar space
 
 On desktop, the empty space below the thread list now moves the window, like
 the title bar. The thread list no longer stretches to fill the sidebar;
@@ -14,10 +14,10 @@ mobile are unchanged.
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 1ed3065a92c..1836ff104d3 100644
+index e6cdb90d5c..6629948046 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -3201,7 +3201,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3199,7 +3199,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            </SidebarGroup>
          }
        >
@@ -26,11 +26,11 @@ index 1ed3065a92c..1836ff104d3 100644
            {isSearchingThreads ? (
              threadSearchResults.length > 0 ? (
                <TooltipProvider
-@@ -3640,6 +3640,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
-             </div>
+@@ -3661,6 +3661,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+             </TooltipProvider>
            ) : null}
          </SidebarGroup>
 +        {isElectron ? <div aria-hidden className="drag-region min-h-0 flex-1" /> : null}
        </SidebarContent>
        <SidebarChromeFooter />
-     </>
+     </SidebarFolderDrop>

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Mon, 2 Nov 2026 23:37:37 +0100
-Subject: [PATCH 09/11] Local: show CLI proxy routing, history and health
+Subject: [PATCH 09/13] Local: show CLI proxy routing, history and health
 
 A CLIProxyAPI fork serves routing, quota-history and fork-status endpoints beside
 the stock management API. The server now reads them with each source refresh
@@ -30,13 +30,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../chat/ThreadDetailsUsage.logic.test.ts     | 130 +++++++++-
  .../chat/ThreadDetailsUsage.logic.ts          | 104 +++++---
  .../components/chat/ThreadDetailsUsage.tsx    |  96 ++++++-
- .../components/usage/UsageLimitsPooled.tsx    |  98 +++++--
+ .../components/usage/UsageLimitsPooled.tsx    |  96 +++++--
  .../src/components/usage/UsageSparkline.tsx   | 155 +++++++++++
  .../usage/proxyObservability.test.ts          | 140 ++++++++++
  .../components/usage/proxyObservability.ts    | 103 ++++++++
  apps/web/src/lib/proxyRouting.ts              | 113 ++++++++
  packages/contracts/src/providerUsageLimits.ts |  96 +++++++
- 15 files changed, 1547 insertions(+), 80 deletions(-)
+ 15 files changed, 1546 insertions(+), 79 deletions(-)
  create mode 100644 apps/server/src/usage/cliproxyObservability.test.ts
  create mode 100644 apps/server/src/usage/cliproxyObservability.ts
  create mode 100644 apps/web/src/components/chat/ProxySwitchBanner.tsx
@@ -46,10 +46,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 apps/web/src/lib/proxyRouting.ts
 
 diff --git a/apps/server/src/usage/UsageLimitSources.ts b/apps/server/src/usage/UsageLimitSources.ts
-index 7d40b0fb9ec..3a2bd80a452 100644
+index d6f867d621..5b9785557a 100644
 --- a/apps/server/src/usage/UsageLimitSources.ts
 +++ b/apps/server/src/usage/UsageLimitSources.ts
-@@ -56,6 +56,26 @@ function missingManagementKey(config: UsageLimitSourceConfig): string {
+@@ -58,6 +58,26 @@ function missingManagementKey(config: UsageLimitSourceConfig): string {
      : "Could not read the management key from its secret provider.";
  }
  
@@ -76,7 +76,7 @@ index 7d40b0fb9ec..3a2bd80a452 100644
  /** @public */
  export const make = Effect.gen(function* () {
    const api = yield* makeCliproxyApi;
-@@ -69,6 +89,8 @@ export const make = Effect.gen(function* () {
+@@ -71,6 +91,8 @@ export const make = Effect.gen(function* () {
      return settingsSecretLiteral(resolved.managementKey);
    });
    const stateRef = yield* Ref.make<ReadonlyArray<UsageLimitSourceSnapshot>>([]);
@@ -85,7 +85,7 @@ index 7d40b0fb9ec..3a2bd80a452 100644
    const changes = yield* Effect.acquireRelease(
      PubSub.unbounded<ReadonlyArray<UsageLimitSourceSnapshot>>(),
      PubSub.shutdown,
-@@ -84,14 +106,18 @@ export const make = Effect.gen(function* () {
+@@ -98,14 +120,18 @@ export const make = Effect.gen(function* () {
      if (managementKey.length === 0) {
        return { ...base, accounts: [], error: missingManagementKey(config) };
      }
@@ -109,7 +109,7 @@ index 7d40b0fb9ec..3a2bd80a452 100644
    });
  
    const publish = Effect.fn("UsageLimitSources.publish")(function* (
-@@ -120,6 +146,29 @@ export const make = Effect.gen(function* () {
+@@ -134,6 +160,29 @@ export const make = Effect.gen(function* () {
      yield* publish(snapshots);
    }).pipe(refreshLock.withPermits(1), Effect.ignoreCause({ log: true }));
  
@@ -139,7 +139,7 @@ index 7d40b0fb9ec..3a2bd80a452 100644
    // Shares the refresh lock so a stale in-flight read cannot overwrite a redemption.
    const consumeResetCredit = Effect.fn("UsageLimitSources.consumeResetCredit")(function* (
      input: UsageLimitSourceConsumeResetCreditInput,
-@@ -175,6 +224,14 @@ export const make = Effect.gen(function* () {
+@@ -189,6 +238,14 @@ export const make = Effect.gen(function* () {
      ),
    ).pipe(Effect.forkScoped);
  
@@ -155,18 +155,18 @@ index 7d40b0fb9ec..3a2bd80a452 100644
  
    return {
 diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
-index 1b36e819e29..2110774e6a3 100644
+index 91b6bca6ed..a20e527bff 100644
 --- a/apps/server/src/usage/cliproxyApi.ts
 +++ b/apps/server/src/usage/cliproxyApi.ts
-@@ -17,6 +17,7 @@ import { codexPlanLabel } from "../provider/CodexProvider.ts";
- import { codexRateLimitsToLimits } from "../provider/codexUsageLimits.ts";
- import { claudeUsageResponseToLimits } from "../provider/claudeUsageLimits.ts";
- import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
+@@ -32,6 +32,7 @@ import {
+   makeUnavailableUsageLimits,
+   makeUsageLimits,
+ } from "@t3tools/provider-core/server/usageLimits";
 +import { toHealth, toHistory, toRouting } from "./cliproxyObservability.ts";
  
  /** A hub with its management key already read from wherever the setting keeps it. */
  export interface CliproxyHub {
-@@ -182,13 +183,14 @@ export const makeCliproxyApi = Effect.gen(function* () {
+@@ -409,13 +410,14 @@ export const makeCliproxyApi = Effect.gen(function* () {
      hub: CliproxyHub,
      path: string,
      body?: unknown,
@@ -182,7 +182,7 @@ index 1b36e819e29..2110774e6a3 100644
        },
        catch: () => new UsageLimitSourceError({ detail: "The hub URL is not valid." }),
      });
-@@ -445,5 +447,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
+@@ -563,5 +565,25 @@ export const makeCliproxyApi = Effect.gen(function* () {
        ),
      );
    });
@@ -211,7 +211,7 @@ index 1b36e819e29..2110774e6a3 100644
  });
 diff --git a/apps/server/src/usage/cliproxyObservability.test.ts b/apps/server/src/usage/cliproxyObservability.test.ts
 new file mode 100644
-index 00000000000..ae9b8d6416e
+index 0000000000..ae9b8d6416
 --- /dev/null
 +++ b/apps/server/src/usage/cliproxyObservability.test.ts
 @@ -0,0 +1,209 @@
@@ -426,7 +426,7 @@ index 00000000000..ae9b8d6416e
 +});
 diff --git a/apps/server/src/usage/cliproxyObservability.ts b/apps/server/src/usage/cliproxyObservability.ts
 new file mode 100644
-index 00000000000..b98a2b1cb2c
+index 0000000000..b98a2b1cb2
 --- /dev/null
 +++ b/apps/server/src/usage/cliproxyObservability.ts
 @@ -0,0 +1,241 @@
@@ -672,10 +672,10 @@ index 00000000000..b98a2b1cb2c
 +  };
 +}
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 11684c52d2e..8405a0d4ef7 100644
+index 153b897b24..98df1d263c 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -318,6 +318,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
+@@ -340,6 +340,7 @@ import { useIncrementalTimelineEntries } from "../hooks/useIncrementalTimelineEn
  import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
  import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
@@ -683,7 +683,7 @@ index 11684c52d2e..8405a0d4ef7 100644
  import { ComposerStats } from "./chat/ComposerStats";
  import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
  import { ComposerSurface } from "./chat/ComposerSurface";
-@@ -2633,6 +2634,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2678,6 +2679,11 @@ export default function ChatView(props: ChatViewProps) {
            },
          })
        : null;
@@ -695,7 +695,7 @@ index 11684c52d2e..8405a0d4ef7 100644
    const composerBannerItems = (() => {
      const fallbackSelection = draftFallback?.selection;
      const defaultSelection =
-@@ -2684,7 +2690,10 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2729,7 +2735,10 @@ export default function ChatView(props: ChatViewProps) {
        deriveProviderExtensionStatuses(serverProjection),
      );
      const extensionStatusItems = extensionStatusBanner === null ? [] : [extensionStatusBanner];
@@ -707,7 +707,7 @@ index 11684c52d2e..8405a0d4ef7 100644
      const projectCloneItems = projectCloneBannerItem === null ? [] : [projectCloneBannerItem];
      // An approval's feedback goes to that approval; the armed session waits for the next message.
      const freshSessionItems =
-@@ -4039,6 +4048,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -4053,6 +4062,7 @@ export default function ChatView(props: ChatViewProps) {
                      providerInstanceId: activeProviderInstanceId,
                      providers: providerStatuses,
                      sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
@@ -717,7 +717,7 @@ index 11684c52d2e..8405a0d4ef7 100644
                  />
 diff --git a/apps/web/src/components/chat/ProxySwitchBanner.tsx b/apps/web/src/components/chat/ProxySwitchBanner.tsx
 new file mode 100644
-index 00000000000..660b6e676e2
+index 0000000000..660b6e676e
 --- /dev/null
 +++ b/apps/web/src/components/chat/ProxySwitchBanner.tsx
 @@ -0,0 +1,37 @@
@@ -759,7 +759,7 @@ index 00000000000..660b6e676e2
 +  };
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
-index b14b2c8cb67..75411523b30 100644
+index b14b2c8cb6..75411523b3 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.test.ts
 @@ -8,7 +8,7 @@ import {
@@ -950,7 +950,7 @@ index b14b2c8cb67..75411523b30 100644
 +  return account.usageLimits;
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
-index 7b3c5b1a417..aaf2fafae64 100644
+index 7b3c5b1a41..aaf2fafae6 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.logic.ts
 @@ -13,6 +13,13 @@ import {
@@ -1092,12 +1092,12 @@ index 7b3c5b1a417..aaf2fafae64 100644
 +  return route ? { kind: "next", ...route } : null;
  }
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index 4e40bb81931..fec7dee3d29 100644
+index 056893e4be..04527239b8 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 @@ -22,7 +22,12 @@ import { formatUpcomingTimestamp } from "../../timestampFormat";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
- import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+ import { formatContextWindowCompactionMessage } from "./compaction.logic";
  import { ThreadDetailsSection } from "./ThreadDetailsSection";
 -import { resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
 +import {
@@ -1230,13 +1230,13 @@ index 4e40bb81931..fec7dee3d29 100644
  function PooledLimitRow({
    window,
 diff --git a/apps/web/src/components/usage/UsageLimitsPooled.tsx b/apps/web/src/components/usage/UsageLimitsPooled.tsx
-index bc69ca4e340..bf85f73ed43 100644
+index 8ec1c7a02a..52951fe1c7 100644
 --- a/apps/web/src/components/usage/UsageLimitsPooled.tsx
 +++ b/apps/web/src/components/usage/UsageLimitsPooled.tsx
-@@ -47,6 +47,20 @@ import {
-   resetCreditsSummary,
-   useResetCredit,
- } from "./UsageLimits";
+@@ -42,6 +42,20 @@ import { OpenAI } from "../Icons";
+ import { Alert, AlertTitle } from "../ui/alert";
+ import { Popover, PopoverCreateHandle, PopoverPopup, PopoverTrigger } from "../ui/popover";
+ import { PaceIcon, ResetCreditDialog, barColor, usePaceMark, useResetCredit } from "./UsageLimits";
 +import { describeAdaptiveWindow } from "../../lib/proxyRouting";
 +import {
 +  collectProxyHealthNotices,
@@ -1254,15 +1254,15 @@ index bc69ca4e340..bf85f73ed43 100644
  
  function accountInitials(email: string): string {
    const [local = "", domain = ""] = email.split("@");
-@@ -196,6 +210,7 @@ function SegmentPopover({
+@@ -193,6 +207,7 @@ function SegmentPopover({
            <Row label="Restores">+{reset.restoresPercent}% of pool</Row>
          ) : null}
        </div>
 +      <ProxyAccountDetails account={account} window={window} now={now} />
-       {credits && redeem ? (
-         <div className="border-t border-border/60 pt-2.5 text-muted-foreground">
-           <span className="flex items-center gap-3">
-@@ -216,6 +231,37 @@ function SegmentPopover({
+       {choices.length > 0 && redeem ? (
+         <div className="flex flex-col gap-1.5 border-t border-border/60 pt-2.5 text-muted-foreground">
+           {choices.map((choice) => (
+@@ -217,6 +232,37 @@ function SegmentPopover({
    );
  }
  
@@ -1300,7 +1300,7 @@ index bc69ca4e340..bf85f73ed43 100644
  /**
   * Every segment on the page shares one popover, so hovering or clicking another
   * segment moves it instead of opening a second one. The payload is the segment
-@@ -448,6 +494,7 @@ function LegendRow({
+@@ -450,6 +496,7 @@ function LegendRow({
  }) {
    const popover = use(SegmentPopoverContext) ?? undefined;
    const { account, window } = payload;
@@ -1308,7 +1308,7 @@ index bc69ca4e340..bf85f73ed43 100644
    const remaining = remainingPercent(window);
    const resetsIn = formatResetsIn(window, now);
    const credits = account.limits.resetCredits?.availableCount ?? 0;
-@@ -470,6 +517,7 @@ function LegendRow({
+@@ -472,6 +519,7 @@ function LegendRow({
        </span>
        <AccountName account={account} className="min-w-0 truncate font-medium text-foreground" />
        <span className="shrink-0 font-semibold text-foreground tabular-nums">{remaining}%</span>
@@ -1316,7 +1316,7 @@ index bc69ca4e340..bf85f73ed43 100644
        <span className="ms-auto flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground tabular-nums">
          {resetsIn?.replace("resets in ", "↻ ") ?? ""}
          {credits ? (
-@@ -614,7 +662,11 @@ export function UsageLimitsPooled({
+@@ -629,7 +677,11 @@ export function UsageLimitsPooled({
    const [segmentPopover] = useState(() => PopoverCreateHandle<SegmentPayload>());
    const segmentPopoverActions = useRef<PopoverPrimitive.Root.Actions | null>(null);
    const pools = collectLimitPools(collectLimitAccounts(presentations), now);
@@ -1327,16 +1327,15 @@ index bc69ca4e340..bf85f73ed43 100644
 +  ];
 +  const proxyObservability = collectProxyObservability(presentations);
    const externalLinks = collectExternalUsageLinks(presentations);
-   const cursorPromptAt =
-     Math.max(
-@@ -628,27 +680,29 @@ export function UsageLimitsPooled({
+   return (
+     <div className="flex flex-col gap-8">
+@@ -638,26 +690,28 @@ export function UsageLimitsPooled({
            No provider on the selected environments reports subscription limits.
          </p>
        ) : null}
 -      <SegmentPopoverContext value={segmentPopover}>
--        {pools.map((pool, index) => (
+-        {pools.map((pool) => (
 -          <Fragment key={pool.driver}>
--            {index === cursorPromptAt ? cursorPrompt : null}
 -            <PoolSection pool={pool} now={now} />
 -          </Fragment>
 -        ))}
@@ -1356,9 +1355,8 @@ index bc69ca4e340..bf85f73ed43 100644
 -      </Popover>
 +      <ProxyObservabilityContext value={proxyObservability}>
 +        <SegmentPopoverContext value={segmentPopover}>
-+          {pools.map((pool, index) => (
++          {pools.map((pool) => (
 +            <Fragment key={pool.driver}>
-+              {index === cursorPromptAt ? cursorPrompt : null}
 +              <PoolSection pool={pool} now={now} />
 +            </Fragment>
 +          ))}
@@ -1377,12 +1375,12 @@ index bc69ca4e340..bf85f73ed43 100644
 +          }
 +        </Popover>
 +      </ProxyObservabilityContext>
-       {cursorPromptAt === pools.length ? cursorPrompt : null}
        {externalLinks.map((link) => (
          <section
+           key={link.url}
 diff --git a/apps/web/src/components/usage/UsageSparkline.tsx b/apps/web/src/components/usage/UsageSparkline.tsx
 new file mode 100644
-index 00000000000..d013a41776d
+index 0000000000..d013a41776
 --- /dev/null
 +++ b/apps/web/src/components/usage/UsageSparkline.tsx
 @@ -0,0 +1,155 @@
@@ -1543,7 +1541,7 @@ index 00000000000..d013a41776d
 +}
 diff --git a/apps/web/src/components/usage/proxyObservability.test.ts b/apps/web/src/components/usage/proxyObservability.test.ts
 new file mode 100644
-index 00000000000..219eb9b8901
+index 0000000000..219eb9b890
 --- /dev/null
 +++ b/apps/web/src/components/usage/proxyObservability.test.ts
 @@ -0,0 +1,140 @@
@@ -1689,7 +1687,7 @@ index 00000000000..219eb9b8901
 +});
 diff --git a/apps/web/src/components/usage/proxyObservability.ts b/apps/web/src/components/usage/proxyObservability.ts
 new file mode 100644
-index 00000000000..933eed342f9
+index 0000000000..933eed342f
 --- /dev/null
 +++ b/apps/web/src/components/usage/proxyObservability.ts
 @@ -0,0 +1,103 @@
@@ -1798,7 +1796,7 @@ index 00000000000..933eed342f9
 +}
 diff --git a/apps/web/src/lib/proxyRouting.ts b/apps/web/src/lib/proxyRouting.ts
 new file mode 100644
-index 00000000000..230ea8e93ee
+index 0000000000..230ea8e93e
 --- /dev/null
 +++ b/apps/web/src/lib/proxyRouting.ts
 @@ -0,0 +1,113 @@
@@ -1916,10 +1914,10 @@ index 00000000000..230ea8e93ee
 +  return `${label}: ${share(window.spare)} spare after a ${share(window.reserve)} reserve, ${share(window.used)} used${learning}`;
 +}
 diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
-index b73e208c949..09cbe6dd1d3 100644
+index 30501bb68c..4580ef9c1c 100644
 --- a/packages/contracts/src/providerUsageLimits.ts
 +++ b/packages/contracts/src/providerUsageLimits.ts
-@@ -75,6 +75,98 @@ export const UsageLimitSourceAccount = Schema.Struct({
+@@ -92,6 +92,98 @@ export const UsageLimitSourceAccount = Schema.Struct({
  });
  export type UsageLimitSourceAccount = typeof UsageLimitSourceAccount.Type;
  
@@ -2018,7 +2016,7 @@ index b73e208c949..09cbe6dd1d3 100644
  export const UsageLimitSourceSnapshot = Schema.Struct({
    id: UsageLimitSourceId,
    kind: Schema.Literal("cliproxy"),
-@@ -82,6 +174,10 @@ export const UsageLimitSourceSnapshot = Schema.Struct({
+@@ -103,6 +195,10 @@ export const UsageLimitSourceSnapshot = Schema.Struct({
    checkedAt: IsoDateTime,
    accounts: ForwardCompatibleArray(UsageLimitSourceAccount),
    error: Schema.optional(TrimmedNonEmptyString),
