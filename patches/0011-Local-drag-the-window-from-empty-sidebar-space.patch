@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Fri, 6 Nov 2026 11:15:48 +0100
-Subject: [PATCH 11/14] Local: drag the window from empty sidebar space
+Subject: [PATCH 11/15] Local: drag the window from empty sidebar space
 
 On desktop, the empty space below the thread list now moves the window, like
 the title bar. The thread list no longer stretches to fill the sidebar;
@@ -10,27 +10,63 @@ drag-region class. It shrinks to nothing once the list scrolls, so rows,
 hover, context menus and drag-and-drop reordering are untouched. Web and
 mobile are unchanged.
 ---
- apps/web/src/components/Sidebar.tsx | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
+ apps/web/src/components/Sidebar.tsx                  |  6 +++++-
+ apps/web/src/customizations/features/sidebar-drag.ts | 11 +++++++++++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+ create mode 100644 apps/web/src/customizations/features/sidebar-drag.ts
 
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index e6cdb90d5c..6629948046 100644
+index 9c1918be6b..3903b823c1 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -3199,7 +3199,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -96,6 +96,7 @@ import {
+   type AtomCommandResult,
+ } from "@t3tools/client-runtime/state/runtime";
+ import { isElectron } from "../env";
++import { useCustomizationEnabled } from "../customizations/registry";
+ import {
+   resolveShortcutCommand,
+   shortcutLabelForCommand,
+@@ -918,6 +919,8 @@ function readRouteThreadKey(router: AnyRouter): string | null {
+ }
+ 
+ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReveal }) {
++  // Off in Settings → Customizations, empty sidebar space no longer drags the window.
++  const sidebarDragOn = useCustomizationEnabled("sidebar-drag") && isElectron;
+   const gt = useGT();
+   const messages = useMessages();
+   const {
+@@ -3310,7 +3313,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            </SidebarGroup>
          }
        >
 -        <SidebarGroup className="flex-1" role="presentation">
-+        <SidebarGroup role="presentation">
++        <SidebarGroup className={sidebarDragOn ? undefined : "flex-1"} role="presentation">
            {isSearchingThreads ? (
              threadSearchResults.length > 0 ? (
                <TooltipProvider
-@@ -3661,6 +3661,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3793,6 +3796,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
              </TooltipProvider>
            ) : null}
          </SidebarGroup>
-+        {isElectron ? <div aria-hidden className="drag-region min-h-0 flex-1" /> : null}
++        {sidebarDragOn ? <div aria-hidden className="drag-region min-h-0 flex-1" /> : null}
        </SidebarContent>
        <SidebarChromeFooter />
      </SidebarFolderDrop>
+diff --git a/apps/web/src/customizations/features/sidebar-drag.ts b/apps/web/src/customizations/features/sidebar-drag.ts
+new file mode 100644
+index 0000000000..9b5785f939
+--- /dev/null
++++ b/apps/web/src/customizations/features/sidebar-drag.ts
+@@ -0,0 +1,11 @@
++import { msg } from "gt-react";
++
++import type { CustomizationInfo } from "../registry";
++
++export const customization: CustomizationInfo = {
++  id: "sidebar-drag",
++  title: msg("Drag from the sidebar"),
++  description: msg(
++    "In the desktop app, drag the window by the empty space at the bottom of the sidebar.",
++  ),
++};

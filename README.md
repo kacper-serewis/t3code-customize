@@ -13,6 +13,8 @@ Unofficial. Not affiliated with T3 Tools. For T3 Code Nightly on Linux (AppImage
 - **Subscription switch** when you have more than one signed-in subscription that offers your model. If the current one is on pace to run out before its 5 hour or weekly window resets, a chip like **Opus 5.5 on Personal →** switches the thread to the same model on the one with the most room. It also points out a subscription whose weekly allowance resets within a day mostly unused. Hover it for the reasoning.
 - **Benchmark scores** from [Artificial Analysis](https://artificialanalysis.ai/) in the model picker: each model's best Intelligence Index, and each effort level's score, speed and cost per task in the effort column. It needs a free API key from Artificial Analysis in `~/.t3/userdata/artificial-analysis-api-key` (or `ARTIFICIAL_ANALYSIS_API_KEY`). The server fetches the scores once a day.
 
+- **Speak agent updates**: T3 Code reads the agent's progress aloud with your computer's voice, no screen reader needed. Turn it on in **Settings > Chat > Screen reader**; **Screen reader announcements** sets how much you hear.
+
 Everything else is stock T3 Code, including T3 Connect and the mobile app.
 
 ## Install
@@ -49,7 +51,9 @@ Your current T3 Code keeps working the whole time.
 
 ## Choosing patches
 
-Every patch is on by default. To leave some out, run `t3code-customize patches`. It lists them and asks which to toggle, then offers to rebuild. Or name them directly:
+Every feature can be switched on and off inside T3 Code, without a rebuild: open **Settings > General > Customizations**. Each built-in patch has a switch there, and a change applies right away. The switches are saved in the environment's server settings, so server features such as the usage feed and background polling follow them too.
+
+To leave a patch out of the build altogether, run `t3code-customize patches`. It lists them and asks which to toggle, then offers to rebuild. Or name them directly:
 
 ```sh
 t3code-customize patches off stats material-icons   # by id

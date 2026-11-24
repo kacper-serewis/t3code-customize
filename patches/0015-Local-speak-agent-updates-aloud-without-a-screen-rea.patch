@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kacper=20Serewi=C5=9B?= <kacper@serewis.nl>
+Date: Tue, 24 Nov 2026 10:47:35 +0100
+Subject: [PATCH 15/15] Local: speak agent updates aloud without a screen
+ reader
+
+---
+ apps/web/src/appInit.tsx                      | 13 +++
+ .../components/BackgroundThreadAnnouncer.tsx  |  6 +-
+ .../chat/ThreadActivityAnnouncer.tsx          |  9 +-
+ .../components/settings/SettingsPanels.tsx    | 37 ++++++++
+ .../src/components/settings/settingsSearch.ts | 10 +++
+ .../features/speak-agent-updates.ts           | 12 +++
+ apps/web/src/lib/agentSpeech.test.ts          | 85 +++++++++++++++++++
+ apps/web/src/lib/agentSpeech.ts               | 71 ++++++++++++++++
+ packages/contracts/src/settings.ts            |  2 +
+ 9 files changed, 241 insertions(+), 4 deletions(-)
+ create mode 100644 apps/web/src/customizations/features/speak-agent-updates.ts
+ create mode 100644 apps/web/src/lib/agentSpeech.test.ts
+ create mode 100644 apps/web/src/lib/agentSpeech.ts
+
+diff --git a/apps/web/src/appInit.tsx b/apps/web/src/appInit.tsx
+index c27b3e013b..6e96f0a10f 100644
+--- a/apps/web/src/appInit.tsx
++++ b/apps/web/src/appInit.tsx
+@@ -49,6 +49,7 @@ import {
+ import { syncBrowserChromeTheme } from "./hooks/useTheme";
+ import { startThreadVisitedMigration } from "./hooks/useThreadVisitedMigration";
+ import { installDesktopPasteAsText } from "./lib/desktopPasteAsText";
++import { agentSpeaker, setAgentSpeechEnabled } from "./lib/agentSpeech";
+ import {
+   syncDocumentElectronPlatformClasses,
+   syncDocumentWindowControlsOverlayClass,
+@@ -69,6 +70,17 @@ import { registerOpenFavoriteEditorCommand } from "./components/chat/OpenInPicke
+ import { environmentThreadShells, threadEnvironment } from "./state/threads";
+ import { resolveActiveThreadRouteRef, resolveThreadRouteTarget } from "./threadRoutes";
+ 
++/** Reads agent updates aloud while Speak agent updates is on, and goes quiet when it's turned off. */
++function startAgentSpeech(): void {
++  setAgentSpeechEnabled(() => getClientSettings().speakAgentUpdates);
++  let enabled = getClientSettings().speakAgentUpdates;
++  subscribeClientSettings(() => {
++    const next = getClientSettings().speakAgentUpdates;
++    if (enabled && !next) agentSpeaker.stop();
++    enabled = next;
++  });
++}
++
+ /** Writes appearance settings onto the document, touching only the groups that changed. */
+ function startClientAppearance(): void {
+   const root = document.documentElement;
+@@ -303,6 +315,7 @@ export function startAppServices(): AppRouter {
+   });
+   startMainAppLocationTracking(router);
+   startWorkspaceFocus(router);
++  startAgentSpeech();
+   startBackgroundThreadAnnouncements(appAtomRegistry, router);
+   startMaterialIconsSync();
+   startThreadVisitedMigration(appAtomRegistry);
+diff --git a/apps/web/src/components/BackgroundThreadAnnouncer.tsx b/apps/web/src/components/BackgroundThreadAnnouncer.tsx
+index 649898cf2e..ab278dd720 100644
+--- a/apps/web/src/components/BackgroundThreadAnnouncer.tsx
++++ b/apps/web/src/components/BackgroundThreadAnnouncer.tsx
+@@ -6,6 +6,7 @@ import type { AtomRegistry } from "effect/reactivity";
+ 
+ import { useComposerDraftStore } from "../composerDraftStore";
+ import { createLiveRegion } from "../hooks/useLiveRegion";
++import { agentSpeaker } from "../lib/agentSpeech";
+ import { liveShellEnvironmentIdsAtom } from "../state/shell";
+ import { environmentThreadShells } from "../state/threads";
+ import { resolveActiveThreadRouteRef, resolveThreadRouteTarget } from "../threadRoutes";
+@@ -59,7 +60,10 @@ export function startBackgroundThreadAnnouncements(
+     }
+     const next = nextBackgroundThreadAnnouncement(memory, snapshots, openThreadKey);
+     memory = next.memory;
+-    if (next.announcement !== null) backgroundThreadLiveRegion.announce(next.announcement);
++    if (next.announcement !== null) {
++      backgroundThreadLiveRegion.announce(next.announcement);
++      agentSpeaker.speak(next.announcement, "status");
++    }
+   };
+ 
+   // The draft store changes on every keystroke; only a new open thread matters here.
+diff --git a/apps/web/src/components/chat/ThreadActivityAnnouncer.tsx b/apps/web/src/components/chat/ThreadActivityAnnouncer.tsx
+index 71c1159074..04fd7acf0d 100644
+--- a/apps/web/src/components/chat/ThreadActivityAnnouncer.tsx
++++ b/apps/web/src/components/chat/ThreadActivityAnnouncer.tsx
+@@ -3,6 +3,7 @@ import { memo, useEffect, useRef } from "react";
+ 
+ import { useLiveRegion } from "../../hooks/useLiveRegion";
+ import { m } from "../../i18n/messages";
++import { agentSpeaker } from "../../lib/agentSpeech";
+ import type { TimelineEntry } from "../../session-logic";
+ 
+ import {
+@@ -83,8 +84,9 @@ export const ThreadActivityAnnouncer = memo(function ThreadActivityAnnouncer({
+   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- writes the turn's status, messages and steps to the aria-live region after commit
+   useEffect(() => {
+     const step = stepRef.current;
+-    const write = (text: string, quietMs: number) => {
++    const write = (text: string, quietMs: number, kind: "message" | "step") => {
+       announceDetail(text);
++      agentSpeaker.speak(text, kind);
+       step.quietUntil = Date.now() + quietMs;
+     };
+     const takeWaiting = () => {
+@@ -138,9 +140,10 @@ export const ThreadActivityAnnouncer = memo(function ThreadActivityAnnouncer({
+       const text = asOneAnnouncement(
+         turn.announcement === null ? detail.messages : [...detail.messages, turn.announcement],
+       );
+-      write(text, holdAfter(text));
++      write(text, holdAfter(text), "message");
+     } else if (turn.announcement !== null) {
+       announce(turn.announcement);
++      agentSpeaker.speak(turn.announcement, "status");
+       step.quietUntil = Math.max(step.quietUntil, Date.now() + ACTIVITY_GAP_MS);
+     }
+     // A waiting label is stale once its step is over or the level no longer reads steps.
+@@ -151,7 +154,7 @@ export const ThreadActivityAnnouncer = memo(function ThreadActivityAnnouncer({
+     if (label === null) return;
+     const speakStep = () => {
+       step.waiting = null;
+-      write(label, ACTIVITY_GAP_MS);
++      write(label, ACTIVITY_GAP_MS, "step");
+     };
+     const wait = step.quietUntil - Date.now();
+     if (wait <= 0) {
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index 47cf4911e8..0cc8faeb2f 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -607,6 +607,9 @@ export function useSettingsRestore(onRestored?: () => void) {
+     ...(settings.screenReaderWindowTitle !== DEFAULT_UNIFIED_SETTINGS.screenReaderWindowTitle
+       ? [gt("Screen reader window title")]
+       : []),
++    ...(settings.speakAgentUpdates !== DEFAULT_UNIFIED_SETTINGS.speakAgentUpdates
++      ? [gt("Speak agent updates")]
++      : []),
+     ...(settings.responseStreamingMode !== DEFAULT_UNIFIED_SETTINGS.responseStreamingMode
+       ? [gt("Response streaming")]
+       : []),
+@@ -734,6 +737,7 @@ export function useSettingsRestore(onRestored?: () => void) {
+       toolCallVisibility: DEFAULT_UNIFIED_SETTINGS.toolCallVisibility,
+       screenReaderAnnouncements: DEFAULT_UNIFIED_SETTINGS.screenReaderAnnouncements,
+       screenReaderWindowTitle: DEFAULT_UNIFIED_SETTINGS.screenReaderWindowTitle,
++      speakAgentUpdates: DEFAULT_UNIFIED_SETTINGS.speakAgentUpdates,
+       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
+       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
+       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
+@@ -1505,6 +1509,7 @@ export function ChatSettingsPanel() {
+       </SettingsSection>
+ 
+       <SettingsSection id="screen-reader" title={gt("Screen reader")}>
++        <SpeakAgentUpdatesRow />
+         <ScreenReaderAnnouncementsRow />
+         <ScreenReaderWindowTitleRow />
+       </SettingsSection>
+@@ -1666,6 +1671,38 @@ function ScreenReaderWindowTitleRow() {
+   );
+ }
+ 
++function SpeakAgentUpdatesRow() {
++  const setting = useSearchableSetting();
++  const gt = useGT();
++  const settings = useScopedSettings();
++  const updateSettings = useUpdateScopedSettings();
++  return (
++    <SettingsRow
++      {...setting("speak-agent-updates")}
++      description={gt(
++        "Read agent updates aloud with your computer's voice, no screen reader needed. Screen reader announcements below sets how much you hear. Turn this off if you use a screen reader, or you'll hear updates twice.",
++      )}
++      resetAction={
++        settings.speakAgentUpdates !== DEFAULT_UNIFIED_SETTINGS.speakAgentUpdates ? (
++          <SettingResetButton
++            ariaLabel={gt("Reset speak agent updates to default")}
++            onClick={() =>
++              updateSettings({ speakAgentUpdates: DEFAULT_UNIFIED_SETTINGS.speakAgentUpdates })
++            }
++          />
++        ) : null
++      }
++      control={
++        <Switch
++          checked={settings.speakAgentUpdates}
++          onCheckedChange={(checked) => updateSettings({ speakAgentUpdates: checked })}
++          aria-label={gt("Speak agent updates")}
++        />
++      }
++    />
++  );
++}
++
+ function DiffColorsSettingsRow() {
+   const setting = useSearchableSetting();
+   const gt = useGT();
+diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
+index bed53b7109..458bd3d614 100644
+--- a/apps/web/src/components/settings/settingsSearch.ts
++++ b/apps/web/src/components/settings/settingsSearch.ts
+@@ -525,6 +525,16 @@ export const SETTINGS_SEARCH_ITEMS = [
+       ),
+     ],
+   },
++  {
++    id: "speak-agent-updates",
++    title: msg("Speak agent updates"),
++    to: "/settings/chat",
++    searchTerms: [
++      msg(
++        "speak speech voice read aloud text to speech tts audio hear agent updates status messages steps say",
++      ),
++    ],
++  },
+   {
+     id: "screen-reader-announcements",
+     title: msg("Screen reader announcements"),
+diff --git a/apps/web/src/customizations/features/speak-agent-updates.ts b/apps/web/src/customizations/features/speak-agent-updates.ts
+new file mode 100644
+index 0000000000..5255dd5ef9
+--- /dev/null
++++ b/apps/web/src/customizations/features/speak-agent-updates.ts
+@@ -0,0 +1,12 @@
++import { msg } from "gt-react";
++
++import type { CustomizationInfo } from "../registry";
++
++export const customization: CustomizationInfo = {
++  id: "speak-agent-updates",
++  title: msg("Speak agent updates"),
++  description: msg(
++    "Reads agent updates aloud with your computer's voice, without a screen reader. Screen reader announcements in Chat settings sets how much you hear.",
++  ),
++  settingKey: "speakAgentUpdates",
++};
+diff --git a/apps/web/src/lib/agentSpeech.test.ts b/apps/web/src/lib/agentSpeech.test.ts
+new file mode 100644
+index 0000000000..a67983a385
+--- /dev/null
++++ b/apps/web/src/lib/agentSpeech.test.ts
+@@ -0,0 +1,85 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { createAgentSpeaker, type AgentSpeechSynth } from "./agentSpeech";
++
++function fakeSynth(state: { speaking?: boolean; pending?: boolean } = {}) {
++  const spoken: string[] = [];
++  let cancelled = 0;
++  const synth: AgentSpeechSynth = {
++    speaking: state.speaking ?? false,
++    pending: state.pending ?? false,
++    speak: (text) => spoken.push(text),
++    cancel: () => {
++      cancelled += 1;
++    },
++  };
++  return { synth, spoken, cancelled: () => cancelled };
++}
++
++describe("createAgentSpeaker", () => {
++  it("says nothing while the setting is off", () => {
++    const { synth, spoken } = fakeSynth();
++    createAgentSpeaker(
++      () => synth,
++      () => false,
++    ).speak("Working", "status");
++    expect(spoken).toEqual([]);
++  });
++
++  it("speaks status, messages and steps when idle", () => {
++    const { synth, spoken } = fakeSynth();
++    const speaker = createAgentSpeaker(
++      () => synth,
++      () => true,
++    );
++    speaker.speak("Working", "status");
++    speaker.speak("Looking at the tests.", "message");
++    speaker.speak("Running pnpm test", "step");
++    expect(spoken).toEqual(["Working", "Looking at the tests.", "Running pnpm test"]);
++  });
++
++  it("queues status and messages but drops a step while still speaking", () => {
++    const { synth, spoken } = fakeSynth({ speaking: true });
++    const speaker = createAgentSpeaker(
++      () => synth,
++      () => true,
++    );
++    speaker.speak("Running pnpm test", "step");
++    speaker.speak("Needs approval", "status");
++    speaker.speak("Done.", "message");
++    expect(spoken).toEqual(["Needs approval", "Done."]);
++  });
++
++  it("drops a step while something is queued", () => {
++    const { synth, spoken } = fakeSynth({ pending: true });
++    createAgentSpeaker(
++      () => synth,
++      () => true,
++    ).speak("Reading a file", "step");
++    expect(spoken).toEqual([]);
++  });
++
++  it("skips blank text and works without speech support", () => {
++    const { synth, spoken } = fakeSynth();
++    createAgentSpeaker(
++      () => synth,
++      () => true,
++    ).speak("    ", "message");
++    expect(spoken).toEqual([]);
++    expect(() =>
++      createAgentSpeaker(
++        () => null,
++        () => true,
++      ).speak("Done", "status"),
++    ).not.toThrow();
++  });
++
++  it("stop cancels speech", () => {
++    const { synth, cancelled } = fakeSynth();
++    createAgentSpeaker(
++      () => synth,
++      () => true,
++    ).stop();
++    expect(cancelled()).toBe(1);
++  });
++});
+diff --git a/apps/web/src/lib/agentSpeech.ts b/apps/web/src/lib/agentSpeech.ts
+new file mode 100644
+index 0000000000..c9465e9f4b
+--- /dev/null
++++ b/apps/web/src/lib/agentSpeech.ts
+@@ -0,0 +1,71 @@
++/**
++ * Reads agent updates aloud with the system voice, for people who want to hear
++ * what an agent is doing without running a screen reader. It speaks the same
++ * text the screen reader live regions get.
++ */
++
++/** What an update says: a status (turn started, needs you, done), a message, or a step. */
++export type AgentSpeechKind = "status" | "message" | "step";
++
++export interface AgentSpeechSynth {
++  readonly speaking: boolean;
++  readonly pending: boolean;
++  speak(text: string): void;
++  cancel(): void;
++}
++
++export interface AgentSpeaker {
++  speak(text: string, kind: AgentSpeechKind): void;
++  stop(): void;
++}
++
++/**
++ * Status and messages queue behind what is being said. A step is dropped while
++ * anything is still being said, since a newer step soon replaces it.
++ */
++export function createAgentSpeaker(
++  synth: () => AgentSpeechSynth | null,
++  enabled: () => boolean,
++): AgentSpeaker {
++  return {
++    speak(text, kind) {
++      const trimmed = text.trim();
++      if (trimmed.length === 0 || !enabled()) return;
++      const target = synth();
++      if (target === null) return;
++      if (kind === "step" && (target.speaking || target.pending)) return;
++      target.speak(trimmed);
++    },
++    stop() {
++      synth()?.cancel();
++    },
++  };
++}
++
++function browserSynth(): AgentSpeechSynth | null {
++  if (typeof window === "undefined" || !("speechSynthesis" in window)) return null;
++  const synthesis = window.speechSynthesis;
++  return {
++    get speaking() {
++      return synthesis.speaking;
++    },
++    get pending() {
++      return synthesis.pending;
++    },
++    speak(text) {
++      synthesis.speak(new SpeechSynthesisUtterance(text));
++    },
++    cancel() {
++      synthesis.cancel();
++    },
++  };
++}
++
++let isEnabled: () => boolean = () => false;
++
++/** Points the shared speaker at the setting; called once at app start. */
++export function setAgentSpeechEnabled(read: () => boolean) {
++  isEnabled = read;
++}
++
++export const agentSpeaker = createAgentSpeaker(browserSynth, () => isEnabled());
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 67e047ee00..b67a31bdeb 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -549,6 +549,7 @@ export const ClientSettingsSchema = Schema.Struct({
+     Schema.withDecodingDefault(Effect.succeed("status" as const)),
+   ),
+   screenReaderWindowTitle: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
++  speakAgentUpdates: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   // Retired Labs toggle. Still read as the default for the Usage item in threadDetailsItems.
+   threadDetailsUsageEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   // Sparse show/hide overrides for thread details card items. Missing ids use the client's
+@@ -2139,6 +2140,7 @@ export const ClientSettingsPatch = Schema.Struct({
+   toolCallVisibility: Schema.optionalKey(ToolCallVisibility),
+   screenReaderAnnouncements: Schema.optionalKey(ScreenReaderAnnouncements),
+   screenReaderWindowTitle: Schema.optionalKey(Schema.Boolean),
++  speakAgentUpdates: Schema.optionalKey(Schema.Boolean),
+   threadDetailsUsageEnabled: Schema.optionalKey(Schema.Boolean),
+   threadDetailsItems: Schema.optionalKey(Schema.Record(Schema.String, Schema.Boolean)),
+   sidebarWorkingShelfEnabled: Schema.optionalKey(Schema.Boolean),

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Tue, 17 Nov 2026 00:15:06 +0100
-Subject: [PATCH 14/14] Local: show Artificial Analysis benchmark scores in the
+Subject: [PATCH 14/15] Local: show Artificial Analysis benchmark scores in the
  model picker
 
 The server fetches Artificial Analysis's free model list once a day (four
@@ -32,27 +32,29 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../components/chat/ComposerModelEffort.tsx   | 149 +++++++++++--
  apps/web/src/components/chat/ModelListRow.tsx |  44 ++++
  .../components/chat/ModelPickerContent.tsx    |   4 +
+ .../features/model-benchmarks.ts              |  11 +
  apps/web/src/lib/modelBenchmarks.test.ts      |  92 ++++++++
  apps/web/src/lib/modelBenchmarks.ts           | 116 ++++++++++
- apps/web/src/state/modelBenchmarks.ts         |  23 ++
+ apps/web/src/state/modelBenchmarks.ts         |  30 +++
  packages/client-runtime/src/state/server.ts   |   6 +
  packages/contracts/src/index.ts               |   1 +
  packages/contracts/src/modelBenchmarks.ts     |  63 ++++++
  packages/contracts/src/rpc.ts                 |   9 +
- 18 files changed, 1069 insertions(+), 20 deletions(-)
+ 19 files changed, 1087 insertions(+), 20 deletions(-)
  create mode 100644 apps/server/src/benchmarks/ModelBenchmarkService.ts
  create mode 100644 apps/server/src/benchmarks/artificialAnalysis.test.ts
  create mode 100644 apps/server/src/benchmarks/artificialAnalysis.ts
+ create mode 100644 apps/web/src/customizations/features/model-benchmarks.ts
  create mode 100644 apps/web/src/lib/modelBenchmarks.test.ts
  create mode 100644 apps/web/src/lib/modelBenchmarks.ts
  create mode 100644 apps/web/src/state/modelBenchmarks.ts
  create mode 100644 packages/contracts/src/modelBenchmarks.ts
 
 diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
-index 7925fd8697..ef5c0dd580 100644
+index b276fafb27..c7ce145f2c 100644
 --- a/apps/server/src/auth/RpcAuthorization.ts
 +++ b/apps/server/src/auth/RpcAuthorization.ts
-@@ -114,6 +114,8 @@ export const RPC_REQUIRED_SCOPES = {
+@@ -126,6 +126,8 @@ export const RPC_REQUIRED_SCOPES = {
    [WS_METHODS.serverRetryResourceTelemetry]: AuthDiagnosticsReadScope,
    [WS_METHODS.serverGetUsageSummary]: AuthDiagnosticsReadScope,
    [WS_METHODS.serverRefreshUsageRates]: AuthDiagnosticsReadScope,
@@ -652,42 +654,42 @@ index 0000000000..49281b337f
 +  return models.toSorted((a, b) => a.slug.localeCompare(b.slug));
 +}
 diff --git a/apps/server/src/observability/RpcInstrumentation.ts b/apps/server/src/observability/RpcInstrumentation.ts
-index 4549ee8a33..ea477dd422 100644
+index a4a918fe1d..e5287030fd 100644
 --- a/apps/server/src/observability/RpcInstrumentation.ts
 +++ b/apps/server/src/observability/RpcInstrumentation.ts
-@@ -95,6 +95,7 @@ const RPC_AGGREGATES = {
+@@ -103,6 +103,7 @@ const RPC_AGGREGATES = {
    [WS_METHODS.serverPrepareTriage]: "server",
    [WS_METHODS.serverGetUsageSummary]: "server",
    [WS_METHODS.serverRefreshUsageRates]: "server",
 +  [WS_METHODS.serverGetModelBenchmarks]: "server",
    [WS_METHODS.serverSignalProcess]: "server",
    [WS_METHODS.serverReportClientActivity]: "server",
-   [WS_METHODS.scheduledTasksSubscribe]: "scheduledTasks",
+   [WS_METHODS.workflowsSubscribe]: "workflows",
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 2edd25fb0a..768ed4ea8f 100644
+index 2875e58718..c190fb1c02 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -209,6 +209,7 @@ import { MuseUsageHome } from "@t3tools/provider-muse/server";
+@@ -226,6 +226,7 @@ import { MuseUsageHome } from "@t3tools/provider-muse/server";
  import * as CursorAccountReader from "@t3tools/provider-cursor/server/CursorAccountReader";
  import * as CursorUsageAccounts from "@t3tools/provider-cursor/server/CursorUsageAccounts";
  import * as UsageService from "./usage/UsageService.ts";
 +import * as ModelBenchmarkService from "./benchmarks/ModelBenchmarkService.ts";
  import * as CodexUsageHistory from "./usage/CodexUsageHistory.ts";
  import * as RuntimeLayer from "./orchestration-v2/runtimeLayer.ts";
- import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
-@@ -800,6 +801,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
+ import * as ThreadViewers from "./orchestration-v2/ThreadViewers.ts";
+@@ -861,6 +862,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
  
  const layerRuntimeDependencies = layerRuntimeCoreDependencies.pipe(
    Layer.provideMerge(layerUsage),
 +  Layer.provideMerge(ModelBenchmarkService.layer),
    Layer.provideMerge(layerBackground),
-   Layer.provideMerge(layerResourceDiagnostics),
-   Layer.provideMerge(TraceDiagnostics.layer),
+   // The same layer the event sink uses; memoized, subscriptions and batch ranking share it.
+   Layer.provideMerge(ThreadViewers.layer),
 diff --git a/apps/server/src/ws.test.ts b/apps/server/src/ws.test.ts
-index f8ad4d3229..eb4b9341cd 100644
+index 806a045898..b738a57961 100644
 --- a/apps/server/src/ws.test.ts
 +++ b/apps/server/src/ws.test.ts
-@@ -140,6 +140,7 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
+@@ -154,6 +154,7 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
  import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
  import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
  import * as UsageService from "./usage/UsageService.ts";
@@ -695,7 +697,7 @@ index f8ad4d3229..eb4b9341cd 100644
  import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
  import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
  import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
-@@ -882,6 +883,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
+@@ -909,6 +910,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
    Layer.mock(ThreadManagement.ThreadManagementService)({}),
    Layer.mock(ThreadSearch.ThreadSearch)({}),
    Layer.mock(UsageService.UsageService)({}),
@@ -704,10 +706,10 @@ index f8ad4d3229..eb4b9341cd 100644
    Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
    Layer.mock(WorkspaceEntries.WorkspaceEntries)({}),
 diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
-index 6defac543e..93bab2301f 100644
+index b6922b9e90..4c0e6ad69a 100644
 --- a/apps/server/src/ws.ts
 +++ b/apps/server/src/ws.ts
-@@ -246,6 +246,7 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
+@@ -260,6 +260,7 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
  import { commandFeatureUsage, featureUsage } from "./telemetry/FeatureUsage.ts";
  import type { TelemetryOwner } from "./telemetry/Identify.ts";
  import * as UsageService from "./usage/UsageService.ts";
@@ -715,7 +717,7 @@ index 6defac543e..93bab2301f 100644
  import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
  import * as TriageService from "./triage/TriageService.ts";
  import * as PullRequestService from "./pullRequest/PullRequestService.ts";
-@@ -1500,6 +1501,7 @@ export const layerWsRpc = (
+@@ -1535,6 +1536,7 @@ export const layerWsRpc = (
                Effect.orElseSucceed(() => null),
              );
        const usage = yield* UsageService.UsageService;
@@ -723,7 +725,7 @@ index 6defac543e..93bab2301f 100644
        const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
        const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
        const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
-@@ -2701,6 +2703,7 @@ export const layerWsRpc = (
+@@ -2816,6 +2818,7 @@ export const layerWsRpc = (
            resourceTelemetry.readHistory(input),
          [WS_METHODS.serverGetUsageSummary]: (input) => usage.readSummary(input),
          [WS_METHODS.serverRefreshUsageRates]: (_input) => usage.refreshRates,
@@ -732,10 +734,10 @@ index 6defac543e..93bab2301f 100644
          [WS_METHODS.serverCheckOtlpEndpoint]: (input) => otlpEndpointCheck.check(input),
          [WS_METHODS.serverListTextGeneratorModels]: (input) => textGenerators.listModels(input),
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
-index f56997ff2a..b4a4be23f2 100644
+index b5d5a519a3..90dae610f8 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
-@@ -4,13 +4,29 @@ import {
+@@ -4,7 +4,14 @@ import {
    isReasoningControl,
    selectableProviderOptionChoices,
  } from "@t3tools/client-runtime/model-traits";
@@ -750,9 +752,11 @@ index f56997ff2a..b4a4be23f2 100644
 +} from "@t3tools/contracts";
  import type { EffortDisplay } from "@t3tools/contracts/settings";
  import { getProviderOptionCurrentLabel } from "@t3tools/shared/model";
- import { CheckIcon, ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
+ import { msg, T, useGT, useMessages } from "gt-react";
+@@ -12,7 +19,16 @@ import { CheckIcon, ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide
  import { type KeyboardEvent, type ReactNode, use, useRef, useState } from "react";
  
+ import { m, type MessageResolver } from "~/i18n/messages";
 +import {
 +  benchmarkScoreShare,
 +  benchmarkVariantForEffort,
@@ -766,7 +770,7 @@ index f56997ff2a..b4a4be23f2 100644
  import {
    Menu,
    MenuPopup,
-@@ -189,8 +205,15 @@ function ColumnRow(props: {
+@@ -197,9 +213,16 @@ function ColumnRow(props: {
    tabStop: boolean;
    isDefault?: boolean | undefined;
    disabled?: boolean;
@@ -778,12 +782,13 @@ index f56997ff2a..b4a4be23f2 100644
 +  detail?: ReadonlyArray<string> | undefined;
    onPick: () => void;
  }) {
+   const gt = useGT();
 +  const tooltip = [props.description, ...(props.detail ?? [])].filter(Boolean);
    const rowProps = {
      type: "button",
      role: "radio",
-@@ -201,12 +224,31 @@ function ColumnRow(props: {
-     "data-effort-level": true,
+@@ -210,12 +233,31 @@ function ColumnRow(props: {
+     "data-effort-level": props.label,
      // Up and Down move between rows.
      tabIndex: props.tabStop ? 0 : -1,
 -    className: COLUMN_ROW,
@@ -814,8 +819,8 @@ index f56997ff2a..b4a4be23f2 100644
 +      ) : null}
        {props.selected ? (
          <>
-           {props.isDefault ? <span className="sr-only">Default</span> : null}
-@@ -217,12 +259,16 @@ function ColumnRow(props: {
+           {props.isDefault ? (
+@@ -232,12 +274,16 @@ function ColumnRow(props: {
        ) : null}
      </>
    );
@@ -834,7 +839,7 @@ index f56997ff2a..b4a4be23f2 100644
        </TooltipPopup>
      </Tooltip>
    );
-@@ -245,7 +291,7 @@ function moveBetweenRows(event: KeyboardEvent<HTMLElement>) {
+@@ -273,7 +319,7 @@ function moveBetweenRows(event: KeyboardEvent<HTMLElement>) {
    next.scrollIntoView({ block: "nearest" });
  }
  
@@ -843,7 +848,7 @@ index f56997ff2a..b4a4be23f2 100644
    const traits = useTraitsSelection(props.traits);
    const { effort, others } = columnControls(traits.selectDescriptors, traits.booleanDescriptors);
    if (traits.modelIsUnavailable) {
-@@ -269,7 +315,9 @@ function EffortLevels(props: { traits: TraitsSelectionInput }) {
+@@ -297,7 +343,9 @@ function EffortLevels(props: { traits: TraitsSelectionInput }) {
      effort?.descriptor.id === traits.primarySelectDescriptor?.id && traits.ultrathinkInBodyText;
    return (
      <>
@@ -854,7 +859,7 @@ index f56997ff2a..b4a4be23f2 100644
        {others.length > 0 ? (
          <div
            className={cn("flex flex-col gap-0.5", effort && "mt-1 border-t border-border/70 pt-1")}
-@@ -299,7 +347,12 @@ function EffortLevels(props: { traits: TraitsSelectionInput }) {
+@@ -327,7 +375,12 @@ function EffortLevels(props: { traits: TraitsSelectionInput }) {
  
  type TraitsSelection = ReturnType<typeof useTraitsSelection>;
  
@@ -865,11 +870,11 @@ index f56997ff2a..b4a4be23f2 100644
 +  locked: boolean;
 +  benchmark: ModelBenchmark | null;
 +}) {
+   const gt = useGT();
+   const messages = useMessages();
    const { control, traits } = props;
-   const { descriptor } = control;
-   if (control.kind === "boolean") {
-@@ -329,18 +382,26 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
-           {ULTRATHINK_IN_BODY_NOTE}
+@@ -363,18 +416,26 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+           {messages(ULTRATHINK_IN_BODY_NOTE)}
          </div>
        ) : null}
 -      {choices.map((option, index) => (
@@ -907,19 +912,19 @@ index f56997ff2a..b4a4be23f2 100644
      </div>
    );
  }
-@@ -492,6 +553,11 @@ function NoEffortRow() {
- /** The model picker's effort column: the selected model's levels and its other options. */
- export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | null }) {
+@@ -539,6 +600,11 @@ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | nul
+   const gt = useGT();
+   const messages = useMessages();
    const picker = use(DockedPickerContext);
 +  const benchmarks = useModelBenchmarks();
 +  const benchmark =
 +    props.traits?.model && benchmarks
 +      ? findModelBenchmark(benchmarks.models, props.traits.model)
 +      : null;
-   const visibility = props.traits ? getTraitsSectionVisibility(props.traits) : null;
-   const controls =
-     props.traits && visibility
-@@ -516,12 +582,55 @@ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | nul
+   const visibility = props.traits
+     ? getTraitsSectionVisibility({ ...props.traits, resolve: messages })
+     : null;
+@@ -568,12 +634,55 @@ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | nul
          // Capture, so Up and Down on an option row move rows instead of opening its menu.
          onKeyDownCapture={moveBetweenRows}
        >
@@ -977,10 +982,10 @@ index f56997ff2a..b4a4be23f2 100644
    "flex h-6 cursor-pointer items-center justify-center gap-1 px-2 text-muted-foreground text-xs outline-none first:rounded-l-md last:rounded-r-md hover:text-foreground data-checked:bg-input/72 data-checked:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset";
  
 diff --git a/apps/web/src/components/chat/ModelListRow.tsx b/apps/web/src/components/chat/ModelListRow.tsx
-index 3838eed5d5..1b899547f5 100644
+index 77ff13923a..61ef17082a 100644
 --- a/apps/web/src/components/chat/ModelListRow.tsx
 +++ b/apps/web/src/components/chat/ModelListRow.tsx
-@@ -11,6 +11,47 @@ import { cn } from "~/lib/utils";
+@@ -12,6 +12,47 @@ import { cn } from "~/lib/utils";
  import { modelPickerModelKey } from "./modelPickerKeys";
  import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
  import type { PickerSubscriptionUsage } from "./ModelPickerUsage.logic";
@@ -1028,7 +1033,7 @@ index 3838eed5d5..1b899547f5 100644
  
  const USAGE_TIER_TAG = {
    "use-now": { label: "Use now", className: "text-success" },
-@@ -46,6 +87,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
+@@ -47,6 +88,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
    providerAccentColor?: string | undefined;
    /** The subscription's 5h and weekly limits, shown at the end of the row. */
    usage?: PickerSubscriptionUsage | undefined;
@@ -1037,7 +1042,7 @@ index 3838eed5d5..1b899547f5 100644
    acpRegistryAgentId?: string | undefined;
    acpRegistryIconUrl?: string | undefined;
    isFavorite: boolean;
-@@ -127,6 +170,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
+@@ -129,6 +172,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
        </div>
  
        <div className="flex shrink-0 items-center gap-1.5">
@@ -1046,27 +1051,27 @@ index 3838eed5d5..1b899547f5 100644
          <Tooltip>
            <TooltipTrigger
 diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
-index 34e988483d..683dd56a91 100644
+index 7be7c8e752..0cf3d9ef05 100644
 --- a/apps/web/src/components/chat/ModelPickerContent.tsx
 +++ b/apps/web/src/components/chat/ModelPickerContent.tsx
-@@ -68,6 +68,8 @@ import {
- import { providerModelKey, sortProviderModelItems } from "../../modelOrdering";
+@@ -77,6 +77,8 @@ import { providerModelKey, sortProviderModelItems } from "../../modelOrdering";
  import { hasRuntimeModelCatalog } from "../../providerModels";
  import { pickerUsageByInstance, sortByPickerUsage } from "./ModelPickerUsage.logic";
+ import { useCustomizationEnabled } from "../../customizations/registry";
 +import { findModelBenchmark } from "~/lib/modelBenchmarks";
 +import { useModelBenchmarks } from "~/state/modelBenchmarks";
  
  type ModelPickerItem = {
    slug: string;
-@@ -523,6 +525,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
-   const entryByInstanceId = new Map(instanceEntries.map((entry) => [entry.instanceId, entry]));
-   // Subscriptions are ordered from "use now" to "do not use yet" by their usage limits.
+@@ -567,6 +569,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+   // Off in Settings → Customizations, the picker keeps upstream's order and shows no limits.
+   const pickerUsageOn = useCustomizationEnabled("model-picker-usage");
    const [openedAtMs] = useState(() => Date.now());
 +  const benchmarkModels = useModelBenchmarks()?.models ?? null;
    const usageByInstance = pickerUsageByInstance(
-     instanceEntries.map((entry) => entry.snapshot),
+     pickerUsageOn ? instanceEntries.map((entry) => entry.snapshot) : [],
      openedAtMs,
-@@ -1064,6 +1067,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -1236,6 +1239,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                      providerDisplayName={model.instanceDisplayName}
                      providerAccentColor={model.instanceAccentColor}
                      usage={usageByInstance.get(model.instanceId)}
@@ -1074,6 +1079,23 @@ index 34e988483d..683dd56a91 100644
                      acpRegistryAgentId={model.acpRegistryAgentId}
                      acpRegistryIconUrl={model.acpRegistryIconUrl}
                      isFavorite={favoritesSet.has(providerModelKey(model.instanceId, model.slug))}
+diff --git a/apps/web/src/customizations/features/model-benchmarks.ts b/apps/web/src/customizations/features/model-benchmarks.ts
+new file mode 100644
+index 0000000000..75dad02399
+--- /dev/null
++++ b/apps/web/src/customizations/features/model-benchmarks.ts
+@@ -0,0 +1,11 @@
++import { msg } from "gt-react";
++
++import type { CustomizationInfo } from "../registry";
++
++export const customization: CustomizationInfo = {
++  id: "model-benchmarks",
++  title: msg("Benchmark scores"),
++  description: msg(
++    "Artificial Analysis Intelligence Index scores per model and effort level in the model picker.",
++  ),
++};
 diff --git a/apps/web/src/lib/modelBenchmarks.test.ts b/apps/web/src/lib/modelBenchmarks.test.ts
 new file mode 100644
 index 0000000000..d889ca30f6
@@ -1296,14 +1318,15 @@ index 0000000000..9a8ca829d8
 +}
 diff --git a/apps/web/src/state/modelBenchmarks.ts b/apps/web/src/state/modelBenchmarks.ts
 new file mode 100644
-index 0000000000..fb5a981100
+index 0000000000..579fbb7a5c
 --- /dev/null
 +++ b/apps/web/src/state/modelBenchmarks.ts
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,30 @@
 +import { useAtomValue } from "@effect/atom-react";
 +import type { ModelBenchmarks } from "@t3tools/contracts";
 +import { AsyncResult, Atom } from "effect/reactivity";
 +
++import { useCustomizationEnabled } from "../customizations/registry";
 +import { environmentSummaries } from "./presentation";
 +import { primaryEnvironmentIdAtom } from "./primaryEnvironment";
 +import { serverEnvironment } from "./server";
@@ -1320,14 +1343,20 @@ index 0000000000..fb5a981100
 +  return AsyncResult.getOrElse(result, () => null);
 +}).pipe(Atom.withLabel("web-model-benchmarks"));
 +
++const noModelBenchmarksAtom = Atom.make((): ModelBenchmarks | null => null).pipe(
++  Atom.withLabel("web-model-benchmarks-off"),
++);
++
++/** Off in Settings → Customizations, the picker shows no scores and never asks the server. */
 +export function useModelBenchmarks(): ModelBenchmarks | null {
-+  return useAtomValue(modelBenchmarksAtom);
++  const benchmarksOn = useCustomizationEnabled("model-benchmarks");
++  return useAtomValue(benchmarksOn ? modelBenchmarksAtom : noModelBenchmarksAtom);
 +}
 diff --git a/packages/client-runtime/src/state/server.ts b/packages/client-runtime/src/state/server.ts
-index cbc4de0bea..0ef23b90ef 100644
+index 61bcd4bcac..77d42e4726 100644
 --- a/packages/client-runtime/src/state/server.ts
 +++ b/packages/client-runtime/src/state/server.ts
-@@ -1467,6 +1467,12 @@ export function createServerEnvironmentAtoms<R, E>(
+@@ -1606,6 +1606,12 @@ export function createServerEnvironmentAtoms<R, E>(
        label: "environment-data:server:trace-diagnostics",
        tag: WS_METHODS.serverGetTraceDiagnostics,
      }),
@@ -1341,17 +1370,17 @@ index cbc4de0bea..0ef23b90ef 100644
        label: "environment-data:server:npm-release",
        tag: WS_METHODS.serverGetNpmRelease,
 diff --git a/packages/contracts/src/index.ts b/packages/contracts/src/index.ts
-index 8dd47df33a..64b4120e59 100644
+index 58863aaebd..1d4d420929 100644
 --- a/packages/contracts/src/index.ts
 +++ b/packages/contracts/src/index.ts
-@@ -64,6 +64,7 @@ export * from "./preview.ts";
+@@ -66,6 +66,7 @@ export * from "./preview.ts";
  export * from "./previewAutomation.ts";
  export * from "./previewCapture.ts";
  export * from "./usage.ts";
 +export * from "./modelBenchmarks.ts";
  export * from "./scheduledTask.ts";
- export * from "./worktreeMcp.ts";
- export * from "./resourceTelemetry.ts";
+ export * from "./milestones.ts";
+ export * from "./workflow.ts";
 diff --git a/packages/contracts/src/modelBenchmarks.ts b/packages/contracts/src/modelBenchmarks.ts
 new file mode 100644
 index 0000000000..af9d59d1a1
@@ -1422,10 +1451,10 @@ index 0000000000..af9d59d1a1
 +});
 +export type ModelBenchmarks = typeof ModelBenchmarks.Type;
 diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
-index e1d392cd08..9aed8677b3 100644
+index c7fe990a4b..db7f450b24 100644
 --- a/packages/contracts/src/rpc.ts
 +++ b/packages/contracts/src/rpc.ts
-@@ -357,6 +357,7 @@ import {
+@@ -409,6 +409,7 @@ import {
    ProviderConsumeResetCreditResult,
  } from "./providerUsageLimits.ts";
  import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
@@ -1433,15 +1462,15 @@ index e1d392cd08..9aed8677b3 100644
  import {
    StorageCleanupReport,
    DatabaseReclaimError,
-@@ -551,6 +552,7 @@ export const WS_METHODS = {
+@@ -632,6 +633,7 @@ export const WS_METHODS = {
    serverReportClientActivity: "server.reportClientActivity",
    serverGetUsageSummary: "server.getUsageSummary",
    serverRefreshUsageRates: "server.refreshUsageRates",
 +  serverGetModelBenchmarks: "server.getModelBenchmarks",
  
-   scheduledTasksSubscribe: "scheduledTasks.subscribe",
-   scheduledTasksUpsert: "scheduledTasks.upsert",
-@@ -1034,6 +1036,12 @@ const WsServerRefreshUsageRatesRpc = Rpc.make(WS_METHODS.serverRefreshUsageRates
+   workflowsSubscribe: "workflows.subscribe",
+   workflowsCounts: "workflows.counts",
+@@ -1183,6 +1185,12 @@ const WsServerRefreshUsageRatesRpc = Rpc.make(WS_METHODS.serverRefreshUsageRates
    error: EnvironmentAuthorizationError,
  });
  
@@ -1454,11 +1483,11 @@ index e1d392cd08..9aed8677b3 100644
  const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess, {
    payload: ServerSignalProcessInput,
    success: ServerSignalProcessResult,
-@@ -2171,6 +2179,7 @@ export const WsRpcGroup = RpcGroup.make(
+@@ -2539,6 +2547,7 @@ export const WsRpcGroup = RpcGroup.make(
    WsServerPrepareTriageRpc,
    WsServerGetUsageSummaryRpc,
    WsServerRefreshUsageRatesRpc,
 +  WsServerGetModelBenchmarksRpc,
    WsServerSignalProcessRpc,
-   WsScheduledTasksSubscribeRpc,
-   WsScheduledTasksUpsertRpc,
+   WsWorkflowsSubscribeRpc,
+   WsWorkflowsCountsRpc,
