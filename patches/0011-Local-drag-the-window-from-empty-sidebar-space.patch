@@ -10,13 +10,13 @@ drag-region class. It shrinks to nothing once the list scrolls, so rows,
 hover, context menus and drag-and-drop reordering are untouched. Web and
 mobile are unchanged.
 ---
- apps/web/src/components/Sidebar.tsx                  |  6 +++++-
- apps/web/src/customizations/features/sidebar-drag.ts | 11 +++++++++++
- 2 files changed, 16 insertions(+), 1 deletion(-)
+ apps/web/src/components/Sidebar.tsx             | 17 +++++++++++++++++
+ .../src/customizations/features/sidebar-drag.ts | 11 +++++++++++
+ 2 files changed, 28 insertions(+)
  create mode 100644 apps/web/src/customizations/features/sidebar-drag.ts
 
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 9c1918be6b..3903b823c1 100644
+index 9c1918be6b..4cb45601a2 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
 @@ -96,6 +96,7 @@ import {
@@ -27,32 +27,50 @@ index 9c1918be6b..3903b823c1 100644
  import {
    resolveShortcutCommand,
    shortcutLabelForCommand,
-@@ -918,6 +919,8 @@ function readRouteThreadKey(router: AnyRouter): string | null {
+@@ -918,6 +919,12 @@ function readRouteThreadKey(router: AnyRouter): string | null {
  }
  
  export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReveal }) {
 +  // Off in Settings → Customizations, empty sidebar space no longer drags the window.
 +  const sidebarDragOn = useCustomizationEnabled("sidebar-drag") && isElectron;
++  // Fills the gap upstream leaves above the first shelf, so that empty space drags the window.
++  const sidebarDragSpacer = (
++    <li key="sidebar-drag-spacer" aria-hidden className="drag-region min-h-0 flex-1 list-none" />
++  );
    const gt = useGT();
    const messages = useMessages();
    const {
-@@ -3310,7 +3313,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
-           </SidebarGroup>
-         }
-       >
--        <SidebarGroup className="flex-1" role="presentation">
-+        <SidebarGroup className={sidebarDragOn ? undefined : "flex-1"} role="presentation">
-           {isSearchingThreads ? (
-             threadSearchResults.length > 0 ? (
-               <TooltipProvider
-@@ -3793,6 +3796,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
-             </TooltipProvider>
-           ) : null}
-         </SidebarGroup>
-+        {sidebarDragOn ? <div aria-hidden className="drag-region min-h-0 flex-1" /> : null}
-       </SidebarContent>
-       <SidebarChromeFooter />
-     </SidebarFolderDrop>
+@@ -3688,6 +3695,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+                             );
+                             break;
+                           case "working-header":
++                            if (sidebarDragOn) items.push(sidebarDragSpacer);
+                             items.push(
+                               <SidebarSectionHeader
+                                 key="working-shelf-header"
+@@ -3703,6 +3711,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+                             );
+                             break;
+                           case "snoozed-header":
++                            if (sidebarDragOn && workingThreads.length === 0) {
++                              items.push(sidebarDragSpacer);
++                            }
+                             items.push(
+                               <SidebarSectionHeader
+                                 key="snoozed-shelf-header"
+@@ -3718,6 +3729,12 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+                             );
+                             break;
+                           case "settled-header":
++                            if (
++                              sidebarDragOn &&
++                              workingThreads.length + snoozedThreads.length === 0
++                            ) {
++                              items.push(sidebarDragSpacer);
++                            }
+                             items.push(
+                               <SidebarSectionHeader
+                                 key="settled-shelf-header"
 diff --git a/apps/web/src/customizations/features/sidebar-drag.ts b/apps/web/src/customizations/features/sidebar-drag.ts
 new file mode 100644
 index 0000000000..9b5785f939
