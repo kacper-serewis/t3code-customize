@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Kacper=20Serewi=C5=9B?= <kacper@serewis.nl>
+Date: Tue, 24 Nov 2026 11:18:10 +0100
+Subject: [PATCH 01/15] Local: switch t3code-customize features on and off in
+ Settings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings → General → Customizations lists every t3code-customize feature built into the app, each with a switch. The switches are stored in a customizations server setting, so server features can follow them too, and a feature without an entry is on. Each patch adds its own file under apps/web/src/customizations/features, so the list shows only the patches that are applied.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../CustomizationsSettingsSection.tsx         | 47 +++++++++++++++++
+ .../components/settings/SettingsPanels.tsx    |  3 ++
+ .../src/components/settings/settingsSearch.ts |  6 +++
+ apps/web/src/customizations/registry.test.ts  | 26 ++++++++++
+ apps/web/src/customizations/registry.ts       | 52 +++++++++++++++++++
+ packages/contracts/src/settings.ts            |  7 +++
+ packages/shared/package.json                  |  4 ++
+ packages/shared/src/customizations.test.ts    | 16 ++++++
+ packages/shared/src/customizations.ts         | 12 +++++
+ 9 files changed, 173 insertions(+)
+ create mode 100644 apps/web/src/components/settings/CustomizationsSettingsSection.tsx
+ create mode 100644 apps/web/src/customizations/registry.test.ts
+ create mode 100644 apps/web/src/customizations/registry.ts
+ create mode 100644 packages/shared/src/customizations.test.ts
+ create mode 100644 packages/shared/src/customizations.ts
+
+diff --git a/apps/web/src/components/settings/CustomizationsSettingsSection.tsx b/apps/web/src/components/settings/CustomizationsSettingsSection.tsx
+new file mode 100644
+index 0000000000..07ab73ce1f
+--- /dev/null
++++ b/apps/web/src/components/settings/CustomizationsSettingsSection.tsx
+@@ -0,0 +1,47 @@
++import { useGT, useMessages } from "gt-react";
++
++import { CUSTOMIZATIONS, customizationSwitchOn } from "../../customizations/registry";
++import { Switch } from "../ui/switch";
++import { SettingsRow, SettingsSection } from "./settingsLayout";
++import { useScopedSettings, useUpdateScopedSettings } from "./useScopedSettings";
++
++/** One switch per t3code-customize feature that is built into this app. */
++export function CustomizationsSettingsSection() {
++  const gt = useGT();
++  const m = useMessages();
++  const settings = useScopedSettings();
++  const updateSettings = useUpdateScopedSettings();
++  if (CUSTOMIZATIONS.length === 0) return null;
++  return (
++    <SettingsSection id="customizations" title={gt("Customizations")}>
++      {CUSTOMIZATIONS.map((info) => {
++        const title = m(info.title);
++        return (
++          <SettingsRow
++            key={info.id}
++            title={title}
++            description={
++              info.appliesAfterReload
++                ? `${m(info.description)} ${gt("Takes effect after a reload.")}`
++                : m(info.description)
++            }
++            settingKeys={info.settingKey === undefined ? ["customizations"] : []}
++            control={
++              <Switch
++                checked={customizationSwitchOn(settings, info)}
++                onCheckedChange={(checked) =>
++                  updateSettings(
++                    info.settingKey === undefined
++                      ? { customizations: { [info.id]: checked } }
++                      : { [info.settingKey]: checked },
++                  )
++                }
++                aria-label={title}
++              />
++            }
++          />
++        );
++      })}
++    </SettingsSection>
++  );
++}
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index 97b278a463..6f9ea05688 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -39,6 +39,7 @@ import * as Schema from "effect/Schema";
+ import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../../branding";
+ import { AboutVersionTitle } from "./AboutVersionTitle";
+ import { CliCommandSettingsRow } from "./CliCommandSettingsRow";
++import { CustomizationsSettingsSection } from "./CustomizationsSettingsSection";
+ import { MobileAppSettingsRow } from "./MobileAppSettingsRow";
+ import {
+   canCheckForUpdate,
+@@ -1222,6 +1223,8 @@ export function GeneralSettingsPanel() {
+           }
+         />
+       </SettingsSection>
++
++      <CustomizationsSettingsSection />
+     </SettingsPageContainer>
+   );
+ }
+diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
+index 1f38ed958d..ff90e4825e 100644
+--- a/apps/web/src/components/settings/settingsSearch.ts
++++ b/apps/web/src/components/settings/settingsSearch.ts
+@@ -1510,6 +1510,12 @@ export const SETTINGS_SEARCH_ITEMS = [
+     to: "/settings/archived",
+     searchTerms: [msg("restore reopen deleted history projects")],
+   },
++  {
++    id: "customizations",
++    title: msg("Customizations"),
++    to: "/settings/general",
++    searchTerms: [msg("t3code-customize patches features turn on off enable disable custom")],
++  },
+ ] as const satisfies ReadonlyArray<SettingsSearchItem>;
+ 
+ export type SettingsSearchItemId = (typeof SETTINGS_SEARCH_ITEMS)[number]["id"];
+diff --git a/apps/web/src/customizations/registry.test.ts b/apps/web/src/customizations/registry.test.ts
+new file mode 100644
+index 0000000000..8a3e332f6f
+--- /dev/null
++++ b/apps/web/src/customizations/registry.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { CUSTOMIZATIONS } from "./registry";
++
++const files = import.meta.glob<{ readonly customization: { readonly id: string } }>(
++  "./features/*.ts",
++  { eager: true },
++);
++
++describe("customizations registry", () => {
++  it("names each feature after its file, which is its patches.json id", () => {
++    for (const [path, module] of Object.entries(files)) {
++      expect(module.customization.id).toBe(path.replace(/^\.\/features\/|\.ts$/g, ""));
++    }
++  });
++
++  it("lists each feature once, with a title and a description", () => {
++    const ids = CUSTOMIZATIONS.map((info) => info.id);
++    expect(new Set(ids).size).toBe(ids.length);
++    expect(ids).toHaveLength(Object.keys(files).length);
++    for (const info of CUSTOMIZATIONS) {
++      expect(info.title.length).toBeGreaterThan(0);
++      expect(info.description.length).toBeGreaterThan(0);
++    }
++  });
++});
+diff --git a/apps/web/src/customizations/registry.ts b/apps/web/src/customizations/registry.ts
+new file mode 100644
+index 0000000000..7fe841dadb
+--- /dev/null
++++ b/apps/web/src/customizations/registry.ts
+@@ -0,0 +1,52 @@
++import type { UnifiedSettings } from "@t3tools/contracts/settings";
++import { isCustomizationEnabled } from "@t3tools/shared/customizations";
++
++import { usePrimarySettings } from "../hooks/useSettings";
++import { appAtomRegistry } from "../rpc/atomRegistry";
++import { primaryServerSettingsAtom } from "../state/server";
++
++type BooleanSettingKey = {
++  [K in keyof UnifiedSettings]-?: UnifiedSettings[K] extends boolean ? K : never;
++}[keyof UnifiedSettings];
++
++/** A t3code-customize feature as the Customizations settings list shows it. */
++export interface CustomizationInfo {
++  /** The patch id in t3code-customize's patches.json. */
++  readonly id: string;
++  /** Text made with msg(), so it can be translated. */
++  readonly title: string;
++  readonly description: string;
++  /** A feature that already has a switch of its own keeps using it. */
++  readonly settingKey?: BooleanSettingKey;
++  /** Shown under the description when a change needs a reload to apply. */
++  readonly appliesAfterReload?: boolean;
++}
++
++// Each patch adds its own file here, so the list holds exactly the patches that are applied.
++const modules = import.meta.glob<{ readonly customization: CustomizationInfo }>("./features/*.ts", {
++  eager: true,
++});
++
++export const CUSTOMIZATIONS: ReadonlyArray<CustomizationInfo> = Object.values(modules)
++  .map((module) => module.customization)
++  .toSorted((left, right) => left.id.localeCompare(right.id));
++
++export function customizationSwitchOn(settings: UnifiedSettings, info: CustomizationInfo): boolean {
++  return info.settingKey === undefined
++    ? isCustomizationEnabled(settings, info.id)
++    : settings[info.settingKey] === true;
++}
++
++/** Whether a feature is on, following the primary environment's settings. */
++export function useCustomizationEnabled(id: string): boolean {
++  return usePrimarySettings((settings) => isCustomizationEnabled(settings, id));
++}
++
++/** The same check outside React. */
++export function customizationEnabled(id: string): boolean {
++  return isCustomizationEnabled(appAtomRegistry.get(primaryServerSettingsAtom), id);
++}
++
++export function subscribeCustomizations(listener: () => void): () => void {
++  return appAtomRegistry.subscribe(primaryServerSettingsAtom, listener);
++}
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index e7887f88f0..6a331f94f8 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -1624,6 +1624,11 @@ export const ServerSettings = Schema.Struct({
+ 
+   /** Sent by the Usage tab with each summary request to this environment; edit in settings.json. Invalid values are ignored. */
+   usageModelFilter: ForwardCompatibleOptional(UsageModelFilter),
++
++  /** t3code-customize: features switched on or off by id. A missing id is on. */
++  customizations: Schema.Record(Schema.String, Schema.Boolean).pipe(
++    Schema.withDecodingDefault(Effect.succeed({})),
++  ),
+ });
+ export type ServerSettings = typeof ServerSettings.Type;
+ 
+@@ -2014,6 +2019,8 @@ export const ServerSettingsPatch = Schema.Struct({
+   usageModelAliases: Schema.optionalKey(
+     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(TrimmedNonEmptyString)),
+   ),
++
++  customizations: Schema.optionalKey(Schema.Record(Schema.String, Schema.Boolean)),
+ });
+ export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
+ 
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index d12cd9b003..b8cdb81ead 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -7,6 +7,10 @@
+       "types": "./src/png.ts",
+       "import": "./src/png.ts"
+     },
++    "./customizations": {
++      "types": "./src/customizations.ts",
++      "import": "./src/customizations.ts"
++    },
+     "./pullRequestAnchor": {
+       "types": "./src/pullRequestAnchor.ts",
+       "import": "./src/pullRequestAnchor.ts"
+diff --git a/packages/shared/src/customizations.test.ts b/packages/shared/src/customizations.test.ts
+new file mode 100644
+index 0000000000..54eb72dbe9
+--- /dev/null
++++ b/packages/shared/src/customizations.test.ts
+@@ -0,0 +1,16 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { isCustomizationEnabled } from "./customizations.ts";
++
++describe("isCustomizationEnabled", () => {
++  it("treats a feature without an entry as on", () => {
++    expect(isCustomizationEnabled({}, "stats")).toBe(true);
++    expect(isCustomizationEnabled({ customizations: {} }, "stats")).toBe(true);
++  });
++
++  it("follows the stored switch", () => {
++    const settings = { customizations: { stats: false, "usage-feed": true } };
++    expect(isCustomizationEnabled(settings, "stats")).toBe(false);
++    expect(isCustomizationEnabled(settings, "usage-feed")).toBe(true);
++  });
++});
+diff --git a/packages/shared/src/customizations.ts b/packages/shared/src/customizations.ts
+new file mode 100644
+index 0000000000..d65f8c0522
+--- /dev/null
++++ b/packages/shared/src/customizations.ts
+@@ -0,0 +1,12 @@
++/**
++ * t3code-customize features can be switched off in Settings without rebuilding. Each one is
++ * known by an id, which matches its entry in the t3code-customize patches.json.
++ */
++export interface CustomizationSettings {
++  readonly customizations?: Readonly<Record<string, boolean>> | undefined;
++}
++
++/** A feature is on unless its id is set to false. */
++export function isCustomizationEnabled(settings: CustomizationSettings, id: string): boolean {
++  return settings.customizations?.[id] ?? true;
++}

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 02:06:07 +0200
-Subject: [PATCH 04/14] Suggest the same model on a subscription with more room
+Subject: [PATCH 05/15] Suggest the same model on a subscription with more room
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -16,27 +16,29 @@ switches the thread through the usual model selection; the tooltip
 explains why and when a started thread cannot switch.
 ---
  apps/web/src/components/ChatView.tsx          |  21 ++
- .../web/src/components/chat/ComposerStats.tsx |  69 ++++++
+ .../web/src/components/chat/ComposerStats.tsx |  72 ++++++
  .../chat/SubscriptionSwitch.logic.test.ts     | 226 ++++++++++++++++++
  .../chat/SubscriptionSwitch.logic.ts          | 225 +++++++++++++++++
- 4 files changed, 541 insertions(+)
+ .../features/subscription-switch.ts           |  11 +
+ 5 files changed, 555 insertions(+)
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.ts
+ create mode 100644 apps/web/src/customizations/features/subscription-switch.ts
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 28138edae1..153b897b24 100644
+index 4378650110..364af07e0f 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -245,6 +245,8 @@ import {
-   type ComposerImageAttachment,
+@@ -256,6 +256,8 @@ import {
    type DraftThreadEnvMode,
+   composerTargetKey,
    useComposerDraftStore,
 +  deriveEffectiveComposerModelState,
 +  useComposerDraftModelState,
    DraftId,
  } from "../composerDraftStore";
  import { type TerminalContextDraft } from "../lib/terminalContext";
-@@ -1513,6 +1515,18 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1583,6 +1585,18 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderThread,
    );
    const activeUsageLimits = activeProviderStatus?.usageLimits;
@@ -55,7 +57,7 @@ index 28138edae1..153b897b24 100644
    const activeProviderName =
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
-@@ -3932,6 +3946,13 @@ export default function ChatView(props: ChatViewProps) {
+@@ -4133,6 +4147,13 @@ export default function ChatView(props: ChatViewProps) {
                                    : compactDisabledReason
                            }
                            isCompacting={isCompacting}
@@ -70,7 +72,7 @@ index 28138edae1..153b897b24 100644
                        )}
                        <div
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index fe42f03499..7d61a0f25e 100644
+index fea1368e21..927212afcf 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -1,5 +1,7 @@
@@ -81,7 +83,7 @@ index fe42f03499..7d61a0f25e 100644
    ServerProviderUsageLimits,
    ServerProviderUsageWindow,
  } from "@t3tools/contracts";
-@@ -27,6 +29,7 @@ import {
+@@ -28,6 +30,7 @@ import {
    selectComposerLimitWindows,
    type RecordedCompaction,
  } from "./ComposerStats.logic";
@@ -89,7 +91,7 @@ index fe42f03499..7d61a0f25e 100644
  
  function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
    const textRef = useRef<HTMLSpanElement>(null);
-@@ -276,6 +279,68 @@ function UsageLimitsSummary({
+@@ -277,6 +280,68 @@ function UsageLimitsSummary({
    );
  }
  
@@ -158,7 +160,7 @@ index fe42f03499..7d61a0f25e 100644
  export function ComposerStats({
    context,
    turn,
-@@ -287,6 +352,7 @@ export function ComposerStats({
+@@ -288,6 +353,7 @@ export function ComposerStats({
    compactDisabled,
    compactDisabledReason,
    isCompacting,
@@ -166,27 +168,33 @@ index fe42f03499..7d61a0f25e 100644
  }: {
    context: ContextWindowSnapshot | null;
    turn: OrchestrationV2ProviderTurn | null;
-@@ -298,6 +364,7 @@ export function ComposerStats({
+@@ -299,9 +365,11 @@ export function ComposerStats({
    compactDisabled: boolean;
    compactDisabledReason: string | null;
    isCompacting: boolean;
 +  subscriptionSwitch?: SubscriptionSwitchInput | null;
  }) {
+   // Off in Settings → Customizations: no Compact now button and no auto-compact details.
+   const compactionOn = useCustomizationEnabled("compaction");
++  const subscriptionSwitchOn = useCustomizationEnabled("subscription-switch");
    const compaction = deriveContextCompaction(context, contextDriver, configuredClaudeThreshold);
    const responseRate = deriveResponseRate(turn);
-@@ -318,6 +385,7 @@ export function ComposerStats({
+   const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
+@@ -321,6 +389,7 @@ export function ComposerStats({
      responseRate === null &&
      compactions.length === 0 &&
      selectComposerLimitWindows(usageLimits?.limits).length === 0 &&
 +    subscriptionSwitch === null &&
-     compactDisabled
+     (compactDisabled || !compactionOn)
    )
      return null;
-@@ -578,6 +646,7 @@ export function ComposerStats({
+@@ -593,6 +662,9 @@ export function ComposerStats({
        {usageLimits && (
          <UsageLimitsSummary limits={usageLimits.limits} providerName={usageLimits.providerName} />
        )}
-+      {subscriptionSwitch && <SubscriptionSwitchChip {...subscriptionSwitch} />}
++      {subscriptionSwitch && subscriptionSwitchOn && (
++        <SubscriptionSwitchChip {...subscriptionSwitch} />
++      )}
        {stats.length > 0 && (
          <span className="ms-auto inline-flex flex-wrap items-center gap-x-2.5">
            {stats.map(({ key, node }, index) => (
@@ -424,7 +432,7 @@ index 0000000000..da5f1aa6e4
 +});
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 new file mode 100644
-index 0000000000..af475f0b2a
+index 0000000000..a027caac44
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -0,0 +1,225 @@
@@ -434,7 +442,7 @@ index 0000000000..af475f0b2a
 +  ServerProviderUsageLimits,
 +  ServerProviderUsageWindow,
 +} from "@t3tools/contracts";
-+import { formatResetsIn } from "@t3tools/shared/usageLimits";
++import { formatResetsIn } from "@t3tools/shared/usageLimitsCopy";
 +
 +import { composerLimitResetPending, composerLimitsFreshness } from "./ComposerStats.logic";
 +
@@ -653,3 +661,20 @@ index 0000000000..af475f0b2a
 +      `${soonest.weekly.window.label.toLowerCase()} allowance is unused and ${resets}. Use it first.`,
 +  );
 +}
+diff --git a/apps/web/src/customizations/features/subscription-switch.ts b/apps/web/src/customizations/features/subscription-switch.ts
+new file mode 100644
+index 0000000000..a0311c3c98
+--- /dev/null
++++ b/apps/web/src/customizations/features/subscription-switch.ts
+@@ -0,0 +1,11 @@
++import { msg } from "gt-react";
++
++import type { CustomizationInfo } from "../registry";
++
++export const customization: CustomizationInfo = {
++  id: "subscription-switch",
++  title: msg("Subscription switch suggestion"),
++  description: msg(
++    "When your subscription runs low, suggests the same model on another subscription with more room, from the stats bar.",
++  ),
++};

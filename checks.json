@@ -26,7 +26,10 @@
     "apps/server/src/environmentTheme.test.ts",
     "apps/web/src/lib/materialIconAlias.test.ts",
     "apps/server/src/benchmarks/artificialAnalysis.test.ts",
-    "apps/web/src/lib/modelBenchmarks.test.ts"
+    "apps/web/src/lib/modelBenchmarks.test.ts",
+    "apps/web/src/lib/agentSpeech.test.ts",
+    "packages/shared/src/customizations.test.ts",
+    "apps/web/src/customizations/registry.test.ts"
   ],
   "typecheck": [
     "apps/server",

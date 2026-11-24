@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sat, 14 Nov 2026 13:45:35 +0100
-Subject: [PATCH 12/14] Local: let theme CSS name images in the themes
+Subject: [PATCH 12/15] Local: let theme CSS name images in the themes
  directory
 
 Theme CSS may hold 20,000 characters, so an embedded background image has
@@ -17,19 +17,42 @@ the web client no longer stores CSS that large for its boot paint.
 
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
- apps/server/src/environmentTheme.test.ts | 28 ++++++++
- apps/server/src/environmentTheme.ts      | 92 +++++++++++++++++++++---
- apps/web/src/themePalette.ts             |  9 ++-
- packages/contracts/src/server.ts         |  6 ++
- packages/shared/src/themeCss.test.ts     | 51 ++++++++++++-
- packages/shared/src/themeCss.ts          | 39 +++++++++-
- 6 files changed, 213 insertions(+), 12 deletions(-)
+ apps/server/src/environmentTheme.test.ts      |  53 ++++++++
+ apps/server/src/environmentTheme.ts           | 116 ++++++++++++++++--
+ .../customizations/features/theme-images.ts   |  11 ++
+ apps/web/src/themePalette.ts                  |   9 +-
+ packages/contracts/src/server.ts              |   6 +
+ packages/shared/src/themeCss.test.ts          |  51 +++++++-
+ packages/shared/src/themeCss.ts               |  39 +++++-
+ 7 files changed, 270 insertions(+), 15 deletions(-)
+ create mode 100644 apps/web/src/customizations/features/theme-images.ts
 
 diff --git a/apps/server/src/environmentTheme.test.ts b/apps/server/src/environmentTheme.test.ts
-index a0bd921ad3..c0c7efed19 100644
+index abced88b2e..5b576d2cca 100644
 --- a/apps/server/src/environmentTheme.test.ts
 +++ b/apps/server/src/environmentTheme.test.ts
-@@ -333,6 +333,34 @@ it.layer(NodeServices.layer)("environment theme", (it) => {
+@@ -62,6 +62,8 @@ const withEnvironmentThemes = <A, E>(
+     /** Receives each theme and appearance the service makes the environment default. */
+     selected?: Array<{ readonly theme?: string; readonly appearance?: string }>;
+     wrapFileSystem?: (fs: FileSystem.FileSystem) => FileSystem.FileSystem;
++    /** Settings → Customizations switches the service reads. */
++    customizations?: Readonly<Record<string, boolean>>;
+   } = {},
+ ) =>
+   Effect.gen(function* () {
+@@ -80,6 +82,11 @@ const withEnvironmentThemes = <A, E>(
+           Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+           Layer.provideMerge(
+             Layer.mock(ServerSettingsService)({
++              getSettings: Effect.succeed({
++                ...DEFAULT_SERVER_SETTINGS,
++                customizations: options.customizations ?? {},
++              }),
++              streamChanges: Stream.empty,
+               updateSettings: (patch) =>
+                 patch.defaultTheme === REFUSED_THEME_ID
+                   ? Effect.fail(
+@@ -685,6 +692,52 @@ describe("environment theme", () => {
        ),
    );
  
@@ -61,16 +84,36 @@ index a0bd921ad3..c0c7efed19 100644
 +    ),
 +  );
 +
++  it.effect("serves theme-file images as written while theme images are switched off", () =>
++    withEnvironmentThemes(
++      {},
++      Effect.gen(function* () {
++        const fs = yield* FileSystem.FileSystem;
++        const path = yield* Path.Path;
++        const { environmentThemesDir } = yield* ServerConfig.ServerConfig;
++        yield* fs.writeFile(path.join(environmentThemesDir, "wall.png"), new Uint8Array([1, 2, 3]));
++        const themes = yield* EnvironmentTheme.EnvironmentThemeService;
++        const css = "body { background: url(theme-file:wall.png); }";
++        yield* themes.apply({ themeId: "walled", theme: { ...NIGHTFALL_THEME, css } });
++        // Clients drop a url() that is not data: or #id, so the image simply does not show.
++        assert.equal((yield* themes.current)[0]?.css, css);
++      }),
++      { customizations: { "theme-images": false } },
++    ),
++  );
++
    it.effect("keeps the served theme when an update does not fit the size limit", () => {
      const large = (name: string): EnvironmentThemeFile => ({
        ...NIGHTFALL_THEME,
 diff --git a/apps/server/src/environmentTheme.ts b/apps/server/src/environmentTheme.ts
-index 0d45fd02de..514b3e792e 100644
+index 4be3c6aa9f..9a4ea063f7 100644
 --- a/apps/server/src/environmentTheme.ts
 +++ b/apps/server/src/environmentTheme.ts
-@@ -13,7 +13,11 @@ import {
+@@ -12,8 +12,13 @@ import {
+   environmentThemeFileHasColors,
    THEME_CSS_MAX_LENGTH,
  } from "@t3tools/contracts";
++import { isCustomizationEnabled } from "@t3tools/shared/customizations";
  import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 -import { themeCssLoadsRemoteFiles } from "@t3tools/shared/themeCss";
 +import {
@@ -78,13 +121,13 @@ index 0d45fd02de..514b3e792e 100644
 +  themeCssLoadsRemoteFiles,
 +  themeFileMediaType,
 +} from "@t3tools/shared/themeCss";
- import { BUILT_IN_THEME_IDS, UNPUBLISHABLE_THEME_IDS } from "@t3tools/shared/themePalettes";
- import * as Cause from "effect/Cause";
- import * as Context from "effect/Context";
-@@ -52,6 +56,12 @@ const MAX_THEME_FILES = 32;
-  */
+ import {
+   MOBILE_DEFAULT_THEME_ID,
+   MOBILE_THEME_IDS,
+@@ -59,6 +64,12 @@ const MAX_THEME_FILES = 32;
  export const MAX_THEME_FILE_BYTES = 6 * THEME_CSS_MAX_LENGTH + 16 * 1024;
- const MAX_THEME_TOTAL_BYTES = 6 * MAX_THEME_FILE_BYTES;
+ // Clients cache every published theme in localStorage, which holds about 5 MB per origin.
+ const MAX_THEME_TOTAL_BYTES = 2 * 1024 * 1024;
 +/** One image that theme CSS names with `url(theme-file:NAME)`. */
 +const MAX_THEME_IMAGE_BYTES = 4 * 1024 * 1024;
 +/** Keeps one theme's served CSS, with its images as base64, under THEME_SERVED_CSS_MAX_LENGTH. */
@@ -94,16 +137,21 @@ index 0d45fd02de..514b3e792e 100644
  
  /** A theme's background is `<id>.<extension>` beside `<id>.json`; earlier extensions win. */
  const THEME_BACKGROUND_EXTENSIONS = ["webp", "png", "jpg", "jpeg"] as const;
-@@ -146,7 +156,7 @@ const pathIsTaken = (filePath: string): boolean => {
+@@ -153,11 +164,11 @@ const pathIsTaken = (filePath: string): boolean => {
  
  /** Validates and reads one handle; rejects symlinked files, allows symlinked directories.
   * Uses non-blocking opens against FIFOs; Windows lacks these flags and checks symlinks with lstat. */
--export const readThemeFileGuarded = (filePath: string, maxBytes: number): string | null => {
-+const readThemeFileBytesGuarded = (filePath: string, maxBytes: number): Buffer | null => {
+-export const readThemeFileGuarded = (
++const readThemeFileBytesGuarded = (
+   filePath: string,
+   maxBytes: number,
+   onMissing?: () => void,
+-): string | null => {
++): Buffer | null => {
    let fd: number;
    try {
      if (NodeFS.constants.O_NOFOLLOW === undefined && NodeFS.lstatSync(filePath).isSymbolicLink()) {
-@@ -171,8 +181,7 @@ export const readThemeFileGuarded = (filePath: string, maxBytes: number): string
+@@ -183,8 +194,7 @@ export const readThemeFileGuarded = (
        if (read <= 0) break;
        offset += read;
      }
@@ -113,14 +161,17 @@ index 0d45fd02de..514b3e792e 100644
    } catch {
      return null;
    } finally {
-@@ -209,7 +218,21 @@ export function findThemeBackground(
+@@ -221,10 +231,26 @@ export function findThemeBackground(
    return null;
  }
  
--export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
 +/** The same guarded read, as text. */
-+export const readThemeFileGuarded = (filePath: string, maxBytes: number): string | null => {
-+  const contents = readThemeFileBytesGuarded(filePath, maxBytes);
++export const readThemeFileGuarded = (
++  filePath: string,
++  maxBytes: number,
++  onMissing?: () => void,
++): string | null => {
++  const contents = readThemeFileBytesGuarded(filePath, maxBytes, onMissing);
 +  // Unlike Buffer#toString, TextDecoder drops a UTF-8 BOM, which JSON.parse rejects.
 +  return contents === null ? null : new TextDecoder().decode(contents);
 +};
@@ -129,14 +180,15 @@ index 0d45fd02de..514b3e792e 100644
 + * With `inlineImages`, each `url(theme-file:NAME)` in a theme's CSS becomes the data: address of
 + * that image in the directory, which is how clients are served. Without it, the CSS is as written.
 + */
-+export const readPublishedThemes = Effect.fn(function* (
-+  themesDir: string,
+ export const readPublishedThemes = Effect.fn(function* (
+   themesDir: string,
+   /** Runs when the directory or a file it listed is gone, as when an ancestor moves mid-read. */
+   onPathMissing: Effect.Effect<void> = Effect.void,
 +  options: { readonly inlineImages?: boolean } = {},
-+) {
+ ) {
    const fs = yield* FileSystem.FileSystem;
-   const entries = yield* fs
-     .readDirectory(themesDir)
-@@ -219,6 +242,43 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+   const entries = yield* Effect.catch(fs.readDirectory(themesDir), (error) =>
+@@ -239,6 +265,46 @@ export const readPublishedThemes = Effect.fn(function* (
    const entryNames = new Set(entries);
    let examined = 0;
    let totalBytes = 0;
@@ -158,7 +210,10 @@ index 0d45fd02de..514b3e792e 100644
 +      contents === null ||
 +      imageBytes + contents.length > MAX_THEME_IMAGES_TOTAL_BYTES
 +        ? undefined
-+        : { url: `data:${mediaType};base64,${contents.toString("base64")}`, bytes: contents.length };
++        : {
++            url: `data:${mediaType};base64,${contents.toString("base64")}`,
++            bytes: contents.length,
++          };
 +    if (image === undefined) skippedImages.add(name);
 +    else imageBytes += image.bytes;
 +    images.set(name, image);
@@ -180,7 +235,7 @@ index 0d45fd02de..514b3e792e 100644
    for (const entry of entries.toSorted()) {
      if (!entry.endsWith(THEME_FILE_SUFFIX)) continue;
      const id = entry.slice(0, -THEME_FILE_SUFFIX.length);
-@@ -270,7 +330,19 @@ export const readPublishedThemes = Effect.fn(function* (themesDir: string) {
+@@ -290,7 +356,19 @@ export const readPublishedThemes = Effect.fn(function* (
      }
  
      const background = findThemeBackground(themesDir, id, entryNames);
@@ -199,18 +254,45 @@ index 0d45fd02de..514b3e792e 100644
 +      limit: MAX_THEME_IMAGE_BYTES,
 +    });
    }
+   if (listedFileMissing) yield* onPathMissing;
    return themes;
- });
-@@ -289,7 +361,7 @@ const make = Effect.gen(function* () {
+@@ -309,12 +387,16 @@ const make = Effect.gen(function* () {
+   const watcherScope = yield* Scope.make("sequential");
+   yield* Effect.addFinalizer(() => Scope.close(watcherScope, Exit.void));
  
++  // Off in Settings → Customizations, `url(theme-file:NAME)` is served as written and clients drop it.
++  const themeImagesOn = settings.getSettings.pipe(
++    Effect.map((current) => isCustomizationEnabled(current, "theme-images")),
++    Effect.orElseSucceed(() => true),
++  );
    const refresh = refreshSemaphore.withPermits(1)(
      Effect.gen(function* () {
--      const themes = yield* readPublishedThemes(environmentThemesDir).pipe(
-+      const themes = yield* readPublishedThemes(environmentThemesDir, { inlineImages: true }).pipe(
-         Effect.provideService(FileSystem.FileSystem, fs),
-       );
+-      const themes = yield* readPublishedThemes(
+-        environmentThemesDir,
+-        Ref.set(pathMissing, true),
+-      ).pipe(Effect.provideService(FileSystem.FileSystem, fs));
++      const themes = yield* readPublishedThemes(environmentThemesDir, Ref.set(pathMissing, true), {
++        inlineImages: yield* themeImagesOn,
++      }).pipe(Effect.provideService(FileSystem.FileSystem, fs));
        // Compare the whole value so new fields cannot silently miss republishes.
-@@ -454,7 +526,11 @@ const make = Effect.gen(function* () {
+       const [changed, next] = yield* Ref.modify(
+         published,
+@@ -366,6 +448,14 @@ const make = Effect.gen(function* () {
+     Effect.forkIn(watcherScope),
+     Effect.asVoid,
+   );
++  yield* settings.streamChanges.pipe(
++    Stream.map((current) => isCustomizationEnabled(current, "theme-images")),
++    Stream.changes,
++    Stream.runForEach(() => refresh.pipe(Effect.ignoreCause({ log: true }))),
++    Effect.ignoreCause({ log: true }),
++    Effect.forkIn(watcherScope),
++    Effect.asVoid,
++  );
+ 
+   // One publish at a time: they share a staging path, and each one checks what is served after it.
+   const publishSemaphore = yield* Semaphore.make(1);
+@@ -503,7 +593,11 @@ const make = Effect.gen(function* () {
          known: themes.map(({ id }) => id),
        });
      }
@@ -223,11 +305,28 @@ index 0d45fd02de..514b3e792e 100644
    });
  
    return {
+diff --git a/apps/web/src/customizations/features/theme-images.ts b/apps/web/src/customizations/features/theme-images.ts
+new file mode 100644
+index 0000000000..49dde8fb5a
+--- /dev/null
++++ b/apps/web/src/customizations/features/theme-images.ts
+@@ -0,0 +1,11 @@
++import { msg } from "gt-react";
++
++import type { CustomizationInfo } from "../registry";
++
++export const customization: CustomizationInfo = {
++  id: "theme-images",
++  title: msg("Theme images"),
++  description: msg(
++    "Lets theme CSS show image files from the themes folder with url(theme-file:NAME).",
++  ),
++};
 diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
-index 5e85922759..7a94ec3270 100644
+index d04e7e1671..802b9731ae 100644
 --- a/apps/web/src/themePalette.ts
 +++ b/apps/web/src/themePalette.ts
-@@ -356,8 +356,15 @@ export const environmentThemeDefinitionsAtom = Atom.make((get) => {
+@@ -358,8 +358,15 @@ export const environmentThemeDefinitionsAtom = Atom.make((get) => {
  
  export function storePublishedEnvironmentThemes(definitions: ReadonlyArray<ThemeDefinition>) {
    if (appAtomRegistry.get(publishedThemesAtom) === null) return;
@@ -245,13 +344,13 @@ index 5e85922759..7a94ec3270 100644
      // Without the stored copy the next launch paints stock colors until connect.
    }
 diff --git a/packages/contracts/src/server.ts b/packages/contracts/src/server.ts
-index f2e02c6b0a..0f6093a804 100644
+index 1e70426001..7487666f46 100644
 --- a/packages/contracts/src/server.ts
 +++ b/packages/contracts/src/server.ts
-@@ -628,6 +628,11 @@ const EnvironmentThemeColors = Schema.Record(
+@@ -640,6 +640,11 @@ const EnvironmentThemeColors = Schema.Record(
  );
  
- export const THEME_CSS_MAX_LENGTH = 50_000;
+ export const THEME_CSS_MAX_LENGTH = 100_000;
 +/**
 + * Served CSS can be far longer than a theme file's: the server replaces each
 + * `url(theme-file:NAME)` with the image of that name from the themes directory.
@@ -260,7 +359,7 @@ index f2e02c6b0a..0f6093a804 100644
  
  const environmentThemeFields = {
    version: Schema.optional(Schema.Literal(1)),
-@@ -655,6 +660,7 @@ export const EnvironmentTheme = Schema.Struct({
+@@ -667,6 +672,7 @@ export const EnvironmentTheme = Schema.Struct({
    ...environmentThemeFields,
    /** Revision of the image file published beside the theme; absent without one. */
    background: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(64))),
@@ -269,7 +368,7 @@ index f2e02c6b0a..0f6093a804 100644
  export type EnvironmentTheme = typeof EnvironmentTheme.Type;
  
 diff --git a/packages/shared/src/themeCss.test.ts b/packages/shared/src/themeCss.test.ts
-index 80656a8207..22ae45910a 100644
+index 38cc33a793..3cd0bafde7 100644
 --- a/packages/shared/src/themeCss.test.ts
 +++ b/packages/shared/src/themeCss.test.ts
 @@ -1,6 +1,11 @@
@@ -285,7 +384,7 @@ index 80656a8207..22ae45910a 100644
  
  // %23 decodes to # inside the SVG, so url(%23g) names its own gradient.
  const SVG_WITH_OWN_GRADIENT =
-@@ -36,3 +41,47 @@ describe("themeCssLoadsRemoteFiles", () => {
+@@ -59,3 +64,47 @@ describe("themeCssLoadsRemoteFiles", () => {
      ).toBe(false);
    });
  });
@@ -334,11 +433,11 @@ index 80656a8207..22ae45910a 100644
 +  });
 +});
 diff --git a/packages/shared/src/themeCss.ts b/packages/shared/src/themeCss.ts
-index 910b18150f..9c0c4d0502 100644
+index 9668040f97..20e9fe2554 100644
 --- a/packages/shared/src/themeCss.ts
 +++ b/packages/shared/src/themeCss.ts
-@@ -16,6 +16,39 @@ function fetchesByText(code: string): boolean {
-   return FETCHES_BY_STRING.test(outsideStrings) || URL_NOT_LOCAL.test(outsideStrings);
+@@ -35,6 +35,39 @@ function fetchesOutsideStrings(code: string): boolean {
+   return FETCHES_BY_STRING.test(code) || URL_NOT_LOCAL.test(code);
  }
  
 +/** `url(theme-file:NAME)` names an image in the themes directory. The server inlines it. */
@@ -376,24 +475,24 @@ index 910b18150f..9c0c4d0502 100644
 +
  /**
   * Whether one declaration value can load a remote file. Clients drop those declarations.
-  * A value with var() stays unparsed until use, and an escape can spell `var` or `url` in it,
-@@ -27,7 +60,8 @@ export function themeCssValueFetches(value: string): boolean {
+  * Values with var() can keep escapes that spell `var` or `url`. Refuse escapes that survive
+@@ -47,7 +80,8 @@ export function themeCssValueFetches(value: string): boolean {
  
  /** A text check for early feedback. CSS escapes can dodge it; the client check is the guard. */
  export function themeCssLoadsRemoteFiles(css: string): boolean {
--  const code = css.replace(/\/\*[\s\S]*?\*\//g, "");
+-  const code = withoutStrings(css, true);
 +  // The server swaps a theme file for a data: address before any client sees the CSS.
-+  const code = css.replace(/\/\*[\s\S]*?\*\//g, "").replace(THEME_FILE_URL, "url(#theme-file)");
-   return /@import/i.test(code) || fetchesByText(code);
++  const code = withoutStrings(css.replace(THEME_FILE_URL, "url(#theme-file)"), true);
+   return /@import/i.test(code) || fetchesOutsideStrings(code);
  }
  
-@@ -78,8 +112,9 @@ export const THEME_GUIDE = [
+@@ -98,8 +132,9 @@ export const THEME_GUIDE = [
    `Roles: ${THEME_COLOR_ROLES.join(", ")}.`,
    "",
    "CSS: `css` applies after the app's styles. Use `.dark` or `:root:not(.dark)` for one appearance.",
 -  "It cannot load files: no @import, no image-set(), and url() only with data: or #id.",
 +  "It cannot load remote files: no @import, no image-set(), and url() only with data:, #id, or theme-file:.",
-   'For a background image, copy a JPEG, PNG, or WebP file of up to 16 MB to `<themesDir>/<themeId>.jpg` (or .png, .webp), beside the theme file. CSS shows it with `var(--theme-background-image)`, such as `[data-workspace-area="conversation"] { background: var(--theme-background-image) center / cover no-repeat; }`. Delete the file to remove it. Do not embed images in `css`: it holds 50,000 characters.',
+   'For a background image, copy a JPEG, PNG, or WebP file of up to 16 MB to `<themesDir>/<themeId>.jpg` (or .png, .webp), beside the theme file. CSS shows it with `var(--theme-background-image)`, such as `[data-workspace-area="conversation"] { background: var(--theme-background-image) center / cover no-repeat; }`. Delete the file to remove it. Do not embed images in `css`: it holds 100,000 characters.',
 +  "For more images, `url(theme-file:NAME)` names an avif, webp, png, jpg, or gif of up to 4 MB in `<themesDir>`, and the server inlines it. Put the file there with a shell command.",
    "The app's own rules can be more specific. If a rule has no effect, add !important.",
    "It cannot reach the terminal text, the file tree, or diff internals. Use color roles for those.",

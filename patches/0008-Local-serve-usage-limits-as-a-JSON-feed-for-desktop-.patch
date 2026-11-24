@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 11 Oct 2026 09:21:12 +0200
-Subject: [PATCH 07/14] Local: serve usage limits as a JSON feed for desktop
+Subject: [PATCH 08/15] Local: serve usage limits as a JSON feed for desktop
  widgets
 
 GET /api/usage-limits returns every enabled subscription's session and
@@ -10,17 +10,19 @@ widget such as Dockset can poll it. Requests need the bearer token kept in
 <stateDir>/usage-limits-api-token, created on first start.
 ---
  apps/server/src/server.ts                     |   2 +
- apps/server/src/usage/usageLimitsHttp.test.ts | 147 +++++++++++++++++
- apps/server/src/usage/usageLimitsHttp.ts      | 153 ++++++++++++++++++
- 3 files changed, 302 insertions(+)
+ apps/server/src/usage/usageLimitsHttp.test.ts | 147 ++++++++++++++++
+ apps/server/src/usage/usageLimitsHttp.ts      | 163 ++++++++++++++++++
+ .../src/customizations/features/usage-feed.ts |  11 ++
+ 4 files changed, 323 insertions(+)
  create mode 100644 apps/server/src/usage/usageLimitsHttp.test.ts
  create mode 100644 apps/server/src/usage/usageLimitsHttp.ts
+ create mode 100644 apps/web/src/customizations/features/usage-feed.ts
 
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 47c4a4c9a2..2edd25fb0a 100644
+index 499c1e2acc..2875e58718 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -123,6 +123,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
+@@ -136,6 +136,7 @@ import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegi
  import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
  import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
  import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
@@ -28,14 +30,14 @@ index 47c4a4c9a2..2edd25fb0a 100644
  import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
  import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
  import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
-@@ -841,6 +842,7 @@ const layerMakeRoutes = Layer.mergeAll(
-     ServerHttp.layerAssetRoute,
+@@ -906,6 +907,7 @@ const layerMakeRoutes = Layer.mergeAll(
      ServerHttp.layerAttachmentUploadRoute,
      GuestHttp.layer,
+     LinkThreadHttp.layer,
 +    UsageLimitsHttp.layerUsageLimitsRoute,
      DeviceHubProxy.layer,
      ServerBrowserStream.routeLayer,
-     ServerHttp.layerStaticAndDevRoute,
+     PreviewTunnel.routeLayer,
 diff --git a/apps/server/src/usage/usageLimitsHttp.test.ts b/apps/server/src/usage/usageLimitsHttp.test.ts
 new file mode 100644
 index 0000000000..2678e5cd65
@@ -191,10 +193,10 @@ index 0000000000..2678e5cd65
 +});
 diff --git a/apps/server/src/usage/usageLimitsHttp.ts b/apps/server/src/usage/usageLimitsHttp.ts
 new file mode 100644
-index 0000000000..b29bdb2d52
+index 0000000000..31545ee777
 --- /dev/null
 +++ b/apps/server/src/usage/usageLimitsHttp.ts
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,163 @@
 +// @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto has no timingSafeEqual.
 +import * as NodeCrypto from "node:crypto";
 +import type { ServerProvider, ServerProviderUsageWindow } from "@t3tools/contracts";
@@ -206,7 +208,10 @@ index 0000000000..b29bdb2d52
 +import * as Path from "effect/Path";
 +import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 +
++import { isCustomizationEnabled } from "@t3tools/shared/customizations";
++
 +import * as ServerConfig from "../config.ts";
++import * as ServerSettings from "../serverSettings.ts";
 +import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 +
 +/**
@@ -324,6 +329,13 @@ index 0000000000..b29bdb2d52
 +      "GET",
 +      USAGE_LIMITS_ROUTE_PATH,
 +      Effect.gen(function* () {
++        // Switched off in Settings → Customizations, the feed is not there at all.
++        const settings = yield* ServerSettings.ServerSettingsService;
++        const feedOn = yield* settings.getSettings.pipe(
++          Effect.map((current) => isCustomizationEnabled(current, "usage-feed")),
++          Effect.orElseSucceed(() => true),
++        );
++        if (!feedOn) return HttpServerResponse.text("Not Found", { status: 404, headers: noStore });
 +        const request = yield* HttpServerRequest.HttpServerRequest;
 +        if (!bearerTokenMatches(request.headers.authorization, token)) {
 +          return HttpServerResponse.text("Unauthorized", {
@@ -348,3 +360,20 @@ index 0000000000..b29bdb2d52
 +    );
 +  }),
 +);
+diff --git a/apps/web/src/customizations/features/usage-feed.ts b/apps/web/src/customizations/features/usage-feed.ts
+new file mode 100644
+index 0000000000..a91f9fc506
+--- /dev/null
++++ b/apps/web/src/customizations/features/usage-feed.ts
+@@ -0,0 +1,11 @@
++import { msg } from "gt-react";
++
++import type { CustomizationInfo } from "../registry";
++
++export const customization: CustomizationInfo = {
++  id: "usage-feed",
++  title: msg("Usage limits JSON feed"),
++  description: msg(
++    "Serves your usage limits at /api/usage-limits for desktop widgets. Off, that address answers 404.",
++  ),
++};
