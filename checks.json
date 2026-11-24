@@ -29,7 +29,8 @@
     "apps/web/src/lib/modelBenchmarks.test.ts",
     "apps/web/src/lib/agentSpeech.test.ts",
     "packages/shared/src/customizations.test.ts",
-    "apps/web/src/customizations/registry.test.ts"
+    "apps/web/src/customizations/registry.test.ts",
+    "apps/web/src/components/icons/materialSymbols.test.tsx"
   ],
   "typecheck": [
     "apps/server",
